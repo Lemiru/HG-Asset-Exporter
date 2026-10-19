@@ -1,5 +1,7 @@
 # hgexport: Haunting Ground asset exporter
 
+This project has been created using Clause Opus 5.5.
+
 **hgexport** turns the game files of *Haunting Ground* (Capcom, PlayStation 2,
 2005; the US release, SLUS-210.75) into standard formats you can open in
 Blender, Unity, Unreal or any other modern tool:
