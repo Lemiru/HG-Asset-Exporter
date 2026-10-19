@@ -1,0 +1,18 @@
+# Generated output (re-create with: python -m hgexport all <data> export)
+/export/
+/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Blender
+*.blend
+*.blend1
+
+# Node (Khronos validator, installed separately)
+node_modules/
+
+# Game data and reference files (tests read them from here by default)
+/data/
+/research/

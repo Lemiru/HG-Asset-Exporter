@@ -1,0 +1,767 @@
+# How the game's files work
+
+This document describes the file formats of *Haunting Ground* as the
+exporter reads them, and what each exported value means. It is a reference
+for anyone who wants to extend the exporter, check its work or use the
+extra data in the exports. You do not need it to use the exports.
+
+Each section starts with what the file is for and where it ends up in the
+export, followed by the layout and the details.
+
+## Reading this document
+
+**Notation.** All numbers in files are little-endian unless noted. `u8`,
+`u16`, `u32` are unsigned integers of 8, 16 and 32 bits, `i16` and `i32`
+signed ones, `f32` a 32-bit float. `+0x10` means "16 bytes after the start
+of the structure being described". `3×i16/4096` means three 16-bit integers,
+each divided by 4096 to get the real value.
+
+**Game code addresses.** Values such as `0x1BDF80` are addresses in the
+game's program (`SLUS_210.75`, the US release), given so that anyone with a
+disassembler can find the code that reads the data. You can skip them.
+
+**"Verified"** means checked against something independent: reference
+exports made with the Noesis model viewer, FFmpeg, the game itself (an
+in-game screenshot, a video capture, or a PlayStation 2 emulator), or exact
+consistency across every file of that type in the game.
+
+### A few PlayStation 2 terms
+
+| Term | Meaning |
+| --- | --- |
+| GS | *Graphics Synthesizer*, the console's graphics chip. Its register settings decide how textures are drawn and blended. |
+| Indexed texture, CLUT | Textures store a colour number per pixel (8 bits, or 4 bits) and a *colour look-up table* (CLUT, a palette) of 256 or 16 colours. |
+| PSMT8, PSMT4 | The GS names for 8-bit and 4-bit indexed textures. |
+| CSM1 order | The GS stores a 256-colour palette in blocks of 8 entries with blocks 2 and 3 of every 32 swapped. Entry *i* is found at position `(i & ~0x18) \| (i & 8) << 1 \| (i & 0x10) >> 1`. |
+| Alpha 0x80 | The GS treats 128 (0x80) as fully opaque, not 255. Texture alpha is converted with `min(2a, 255)`. Vertex colours likewise use 0x80 for "1.0". |
+| Triangle strip | Triangles stored as a run of vertices, each new vertex forming a triangle with the two before it. A marker starts a new strip. |
+| VU1, VIF | The vector unit that transforms geometry, and the interface that feeds it data. Only relevant to the GAME_FIX props. |
+| SPU2 | The sound chip. Its native sample format is PS-ADPCM ("VAG"). |
+
+### Game terms used here
+
+| Term | Meaning |
+| --- | --- |
+| Model family | A character's files share a code and folder: `O_FIN/FIN_000.PCK`, `FIN_000.TEX`, `FIN_200.TEX`, `FIN_100.MTN`, … |
+| Bone palette | The list that maps animation *slot numbers* to the skeleton's bones. Animation data addresses bones by slot, which is why exported bone names are `J<slot>`. |
+| X bones | Bones outside the palette. Animations never move them; the game's physics does (cloth, hair, chest). |
+| Motion bank | A set of animations ("clips"), found in models, in separate `.MTN` files and in cutscenes. |
+| Room | One playable area, stored as a `.PAC` file in a `ST_*` folder. |
+| Event | A real-time cutscene, stored as a folder `EVxxxx` (story) or `DExxxx` (mostly death and game-over scenes). |
+| Actor slot | The numbered role a character plays in a cutscene (slot 1 = the player, 2 = Hewie, …). |
+
+## Overview: which file holds what
+
+| Files | What they are | Section | Exported to |
+| --- | --- | --- | --- |
+| `*.TEX` | textures | [Textures](#1-textures-and-images) | `textures/` |
+| `O_*/*.PCK`, `O_T00/*.MDL` | character models with their animations | [Character models](#2-character-models-pck) | `characters/` |
+| `*.MTN` | extra animation banks | [Animation](#3-animation-motion-banks) | inside the character files |
+| `O_*/*.MRK` | per-frame animation markers | [Animation](#3-animation-motion-banks) | character clip extras |
+| `ST_*/*.PAC` | rooms | [Rooms](#4-rooms-pac) | `stages/`, room textures in `textures/` |
+| `O_*/*_D000.MTN` | door-opening curves | [Rooms](#4-rooms-pac) | room clips, `misc/doors/` |
+| `EV*/`, `DE*/` (`.DH`, `.DP`, `MARK.BIN`, `PARAMS.BIN`, `.SFD`) | real-time cutscenes | [Cutscenes](#5-cutscenes) | `cutscenes/` |
+| `*.ADX`, `*.HD` + `*.BD`, `*.SDT`, `BGM/*.SQ` | voices, sound banks, effect tables, music | [Sound and music](#6-sound-and-music) | `audio/`, `music/` |
+| `*.SFD` | movies | [Sound and music](#6-sound-and-music) | `movies/`, cutscene `.mp4` |
+| `SUBSCR/MSG_*.BIN`, room text | text | [Text](#7-text) | `text/` |
+| `SUBSCR/ART*.LEN`, `THUMBNAIL.TXS`, `SYSTEM/*.BIN` | gallery art, thumbnails, logos | [Textures](#1-textures-and-images) | `textures/` |
+| `GAME_FIX.GFM`, `OBSTACLE.MTN`, `SUBSCR/ICON*` | always-loaded props, a raw curve, the memory-card icon | [Other files](#8-other-files) | `misc/` |
+
+---
+
+## 1. Textures and images
+
+### TEX files
+
+*229 files, 326 images. Verified pixel-exact against Noesis. Exported as
+`textures/<folder>/<file>.png`, or `<file>_<n>.png` when a file holds
+several images.*
+
+```
+u32 count, 12 bytes padding
+count × { u32 gs_format (0x13 PSMT8 | 0x14 PSMT4), u16 width, u16 height,
+          u32 layout (unused), u32 payload offset (from this descriptor) }
+payload: colour indices (8 bits per pixel, or 4 bits with the low nibble first),
+         then a 1024-byte palette in CSM1 order
+```
+
+Indices are stored row by row (not in the GS's internal block layout). Row 0
+is the top of the image and UV (0, 0) its top-left corner, as in glTF, so
+nothing needs flipping.
+
+**Texture sets of a character.** `X_000.TEX` holds all of a model family's
+textures ("components"). `X_200.TEX` is a single 512×512 replacement for
+component 0 (the face) that the game installs for cutscenes. `X_000H.TEX` /
+`X_200H.TEX` are alternative sheets the game selects with a story flag, and
+`X_201.TEX`, … are further replacements for component 0. The character
+exports offer all of these as glTF material variants.
+
+**Extra palettes.** Eleven 4-bit images (in `GAME_FIX.TEX`, the SUBSCR files
+`MSG_BASE`, `SUBBASE`, `SUBSAVE`, `SUBMG`, `SYN_SLOT`, `GAL_MOVIE`, and the
+SYSTEM files `AVOID`, `TITLE`) hold several 16-colour palettes in one
+palette block. The game picks one per use (tinted fonts, highlighted
+buttons). The export writes palette 0 as the main PNG and each further
+palette as `<image>_palK.png`.
+
+### How the menu draws its textures
+
+Traced from an emulator save state of the item menu (GS register writes in
+memory, compared with video memory and the screenshot). **The exporter does
+not apply any of this**; it explains why some raw PNGs look unlike the game.
+
+* **Where the menu's images come from:** `SUBSCR/SUBBACK.TEX` holds the
+  parchment pages with their tab headers (Special, Items, File, Map,
+  Comment, Options); `SUBSCR/SUBBASE.TEX` the small item icons, windows,
+  frames and arrows; `SUBSCR/MSG_SUB.TEX` the font; `ITEMxx/ITEM_*.TEX` the
+  large item pictures. All of them are in the export.
+* **Item pictures are stored as colour negatives** and drawn by
+  subtracting half of the picture from the parchment:
+  *screen = background − texture / 2*, limited at 0 (GS blend
+  `Cd − Cs·64/128`). On a light background a negative becomes a positive,
+  sepia-toned picture. Checked on screenshot pixels: parchment
+  (131, 116, 90) with a stored pixel (48, 144, 146) gives (107, 44, 17); the
+  screenshot shows (101, 35, 8). The natural colours of a picture on its own
+  are the inverse, 255 − value.
+* **The font** is drawn the same way (`Cd − Cs`), so it appears as dark ink.
+* **`SUBBASE`** is drawn with palettes 1, 3 and 4. Palette 0, the exported
+  main PNG (washed-out yellow), is not used by the menu; palettes 3 and 4
+  are the natural parchment colours, 1 the bright highlight, 2 the green
+  highlight.
+* **`GAME_FIX.TEX`**: image 2's palette 0 is grey and palette 1 the natural
+  colouring (see [GAME_FIX.GFM](#game_fixgfm-always-loaded-props)); image 1
+  (effects) has a neutral grey palette 0 that is tinted when drawn, and
+  palettes 1–11 carry the effect colours; image 0 (insects) is dark in every
+  palette.
+
+### Gallery art, thumbnails and system images
+
+* **Gallery art** (`SUBSCR/ART00`–`ART05.LEN`, 48 images): a table of
+  `u32` offsets (the first offset equals the table size; 8 entries per
+  file). Each entry is run-length coded 8-bit indices (a byte `c ≥ 0x80`
+  repeats the next byte `c − 0x80` times; otherwise `c` literal bytes
+  follow), then a 1 KiB palette in CSM1 order. 512 pixels wide: 21 portraits
+  of 512×896 and 27 screens of 512×448, in PlayStation 2 pixels (shown on a
+  4:3 screen, so about 1.17× wider). Exported as `textures/SUBSCR/ARTnn_k.png`.
+* **Gallery thumbnails** (`SUBSCR/THUMBNAIL.TXS`): `u32` count, `u32`
+  offsets, one TEX record each: 110 cutscene stills, 128×128 4-bit, the
+  picture in the upper part. Exported as `textures/SUBSCR/THUMBNAIL_nnn.png`.
+* **System images** (`SYSTEM/LOGO_CRI.BIN`, `LOGO_DOLBY.BIN`,
+  `TITLE_BACK.BIN`): no header, just indices followed by the palette; the
+  sizes are fixed in the game's code. `LOGO_CRI`: 640×448, 8-bit (the
+  Sofdec / ADX logos). `LOGO_DOLBY`: 720×540, 8-bit (Dolby Pro Logic II
+  splash, shown scaled to 640×448). `TITLE_BACK`: 640×448, 4-bit (title
+  background). Exported to `textures/SYSTEM/`.
+* **Room textures** live inside each room file (slot 9, see
+  [Rooms](#4-rooms-pac)) and are exported as `textures/ST_xxx/<room>_<n>.png`.
+* **The memory-card icon texture** lives inside `SUBSCR/ICON00.ICO` (see
+  [Other files](#memory-card-icon)) and is exported as
+  `textures/SUBSCR/ICON00.png`.
+
+---
+
+## 2. Character models (PCK)
+
+*115 files. Verified against Noesis: positions, UVs, triangles and bones
+exact. Exported as `characters/<folder>/<model>.glb`.*
+
+A PCK file holds one model: its skeleton, its meshes, its blend shapes
+(faces, hands), simple shadow shapes and its built-in animations.
+
+### Layout
+
+```
+header: +0x04 model   +0x08 blend shapes ("morph section")   +0x0C shadow volumes   +0x10 motion bank
+model:  u32 bone count, then offsets (relative to the model) of the skinned
+        mesh table, the rigid mesh table and the bone palette
+bones:  bone count × 0x70 bytes: i32 parent, Euler angles XYZ at +0x10,
+        translation at +0x20, inverse bind matrix (4×4, column-major as in glTF) at +0x30
+palette: u8 count, count × u8 bone index (animation slot → bone)
+```
+
+**Skinned meshes** (table entries of 0x30 bytes; count at +0, entries from
++0x10) are bent by several bones. Each entry holds the vertex count, then
+offsets (from the entry) to: positions (+4), UVs (+8, `2×i16/32768`),
+normals (+12, `3×i16/32768`), bone weights (+16, `u16/32768` per
+influence), bone numbers (+20, `u8 >> 2` = position in the mesh's own bone
+list), strip markers (+24); then the texture number (+28), render flags
+(+32, bit 0 = alpha blending), the mesh's bone list count (+36) and offset
+(+40), and the number of influences per vertex (+44).
+
+**Rigid meshes** (entries of 0x20 bytes) follow a single bone: positions,
+UVs, normals, strip markers (+16), texture (+20), flags (+24), parent bone
+(+28).
+
+**Positions** are a `3×i32` start value followed by `3×i16` differences, each
+vertex adding to the previous one; divide by 4096.
+
+**Triangle strips.** A marked vertex starts a new strip. From the first
+unmarked vertex on, triangles alternate between `(v−2, v−1, v)` and
+`(v, v−1, v−2)`, giving counter-clockwise triangles that face outwards
+(this agrees with the stored normals for 99.9 % of 329,000 triangles).
+
+**Inverse bind matrices.** The stored matrices are what the game skins with.
+They differ from the skeleton's rest pose for the Debilitas models
+(DB0/DB1/DB2, by 1.9°) and slightly for Hewie, so the exporter uses the
+stored ones.
+
+### Blend shapes ("morphs")
+
+Count at +0, then 0x40-byte descriptors from +0x10: number of shapes, vertex
+count, UV offset, strip marker offset (byte markers, or `i32` sign markers
+when the topology mode is 1), a table with each shape's position and normal
+offsets, parent bone, texture, topology mode, flags and an origin (`3×i32`
+at +0x30). Shape positions are `3×i16` plus the origin, divided by 4096;
+normals are stored in the order Y, Z, X.
+
+Characters use descriptors 0 and 3 for the face and the teeth/eyelashes (16
+shapes each) and 1 and 2 for the left and right hand (10 shapes each). The
+game drives face and teeth with the same controls, so the export gives them
+shared targets (`face_01`…`face_15`); hands become `hand_l_01`… and
+`hand_r_01`…. The game's resting hand pose is shape 1 of each hand, which is
+the exported default.
+
+### How models are drawn (and what that means for transparency)
+
+The game draws each model in two passes (code at `0x1BDF80`): first every
+mesh whose render flag bit 0 is clear, then those with it set. The draw
+setup (`0x2B72D0`) uses the same rules for both passes: pixels whose texture
+alpha is 0 are discarded, depth is tested and written, and bit 0 only turns
+on alpha blending. So unflagged meshes are solid with cut-outs, and flagged
+meshes are blended but still write depth, after the rest of the model.
+
+The flag marks whole meshes that are mostly solid (Fiona's torso with its
+lace hem, skirt panels with lace edges), which would make engines treat
+large opaque areas as transparent. The exporter therefore decides
+transparency per triangle from the texture pixels it can sample
+(`hgexport/export/alpha.py`): opaque if all are at least 88 % opaque (where
+fully opaque pixels dominate the piece; on uniformly tinted glass only
+100 % counts), clipped if they are only nearly empty or nearly solid,
+blended otherwise. No unflagged mesh in the game samples alpha 0, and the
+flagged ones are solid except along hems, fringes and hair ends.
+
+A byte per mesh in the character object (`+136 + 2i`) is combined with the
+mesh's flags when drawing; its bit 1 hides the mesh. The game uses this to
+switch accessories on and off.
+
+### Shadow volumes
+
+*Exported as `characters/<folder>/<model>_shadow.glb`, or inside the model
+with `character --shadow-volumes`.*
+
+The game casts character shadows with stencil shadow volumes: simple boxes,
+one per bone, whose outline it extends away from the light. Layout: `u32`
+count, 12 bytes padding, 32-byte descriptors (`u32 bone, u32 faces`, offsets
+of the face, edge and vertex lists); faces are 48 bytes (4 vertex numbers, 4
+edge numbers, a normal), edges pairs of `u32`, vertices `float4` in the
+bone's own space. All 2,086 volumes in 109 models are closed boxes (8
+vertices, 6 quads). The export holds one mesh with the boxes bound rigidly
+to their bones; they are proxies, not visible geometry.
+
+### The prototype Fiona (O_T00)
+
+`O_T00` holds the same blocks as separate files: `.MDL` (model), `.SHP`
+(blend shapes), `.SHD` (shadow volumes), `.MTN` (animations). Put behind a
+PCK header they form an ordinary PCK: an April 2004 prototype of Fiona with
+68 bones and 116 animations.
+
+### Model variants
+
+**Fiona's `X_000`…`X_006`** (in `O_FIN` and every costume folder `O_FIB`,
+`O_FIC`, `O_FIF`, `O_FIH`, `O_FIO`) share mesh and skeleton. They differ only
+in the animations 5120, 5121, 5123, 5124 and 5376: Fiona's half of the
+animations she plays together with a pursuer (the pursuer's halves are its
+animations 6400, 6401, 6403, 6404 and 6657, with matching lengths). `_006`
+also has one extra animation, 3845.
+
+| File | Pursuer it pairs with (matching animation lengths) |
+| --- | --- |
+| `_000` | Debilitas DB0/DB1/DB2 (3 of 5) |
+| `_001` | Daniella DNL_000 (5/5) |
+| `_002` | Daniella DNL_001 (5/5) |
+| `_003` | Riccardo RCG_000 (5/5) |
+| `_004` | Riccardo RCT_000 (5/5) |
+| `_005` | Lorenzo LRO_000 (3/4; neither has the 5376/6657 pair) |
+| `_006` | Lorenzo LRY_000 (4/5) |
+
+The game picks the set from story progress (loader `0x1A4110`, flags of the
+game-state object `0x44E4D8`). The exports are animation-only files named
+after the pursuer (`FIN_003_RCG_000.glb`), with the base model and pursuer
+in the file's extras (`paired_with`).
+
+**`DNL_001`** is Daniella's later-phase character: a separate game class
+with its own data, used from the same story point that selects Fiona's set
+2, whose paired animations it matches. Its export names `FI*_002` as
+`paired_with`.
+
+**Hewie's `HEW_001`…`HEW_004`** (also `HED`, `HEG`) change his
+attack and command animations (8704–8729) per story chapter. They are not
+paired with pursuer animations; by the shared story flags `_001` belongs to
+Daniella's chapter, `_002` to Riccardo's, `_003` to Lorenzo's LRO chapter,
+`_004` to his LRY chapter, and `_000` to Debilitas'. The exports are
+named after the chapter's pursuer and carry it as `chapter`.
+
+---
+
+## 3. Animation (motion banks)
+
+*All 98 model banks, 35 MTN files and 995 cutscene actor banks use this
+layout. Exported as glTF animations in the character and cutscene files.*
+
+### Layout
+
+```
++0x00 u32 entry count   +0x04 u32 number of used groups   +0x08 0   +0x0C offset of the lookup table
++0x10 entry count × 5 u32: offsets of the entry's five groups ("slots"), relative to the entry (0 = empty)
+group:  u32 track count, u32 frame count, u32 offset of the track table (from the group)
+track:  i32 target, u32 flags (codec = flags & 0xFF; bit 16 = one constant sample),
+        u32 offset of the samples (from the track record)
+lookup: u32 count, 12 bytes padding, count × { u32 resource id, i32 entry } (the last match wins)
+```
+
+An *entry* is one animation. Its slot 0 holds the controller tracks (negative
+targets, see below); slots 1–4 hold bone tracks (target = bone palette
+slot). Slots 2–4 are usually small overlays (ears, tail, mouth); the export
+merges them into the main clip when they have the same length and move
+other bones, and otherwise exports them as `<clip>_layerN`.
+
+**Sample formats ("codecs"):**
+
+| Codec | Per frame | Use |
+| --- | --- | --- |
+| 0 | `3×i16·π/32768` | rotation |
+| 1 | `3×i16/256` | position |
+| 2, 4 | `3×i16` rotation + `3×i16/256` translation | bone with movement |
+| 3 | `4×i16/32767` | four controls |
+| 5 | `i16` shape A, `i16` shape B, `i16/32767` mix | hand pose mixer |
+| 7 | `6×f32` | rotation + translation |
+
+Rotations are Euler angles applied X first, then Y, then Z (`Rz·Ry·Rx`).
+Animations run at 30 frames per second (verified against cutscene audio).
+`*_D000.MTN` files use a different format (door curves, see
+[Rooms](#doors)); `OBSTACLE.MTN` is a plain curve (see
+[Other files](#obstaclemtn)).
+
+### Controller tracks
+
+| Target | Meaning | Exported as |
+| --- | --- | --- |
+| −1 | movement through the room: per-frame turn and step | `--root-motion` adds it as movement of a `<model>_motion` node |
+| −2, −3 | positions of the two foot bones | `foot_points` (only where they differ, see below) |
+| −4 | foot contact flags | `foot_contact` |
+| −5, −6 | Hewie's paw contacts (hind, front) | `foot_contact` |
+| −7…−10 | facial controls (16 values; control *k* drives shape *k* of every face piece) | `face_01`…`face_15` weights |
+| −11, −12 | hand mixers for hand 1 and 2: `shape[A]·(1−mix) + shape[B]·mix` | `hand_l_…`, `hand_r_…` weights |
+
+**Feet (−2…−6).** Tracks −2 and −3 store where the rig's two foot bones are
+(Fiona and most humans: J10 and J22; Riccardo J12 and J24; young Lorenzo J11
+and J23). In every shipped animation they equal the posed skeleton's feet
+within the storage precision, so the export leaves them out, except in
+Fiona's animations 1802 and 1803 (all costumes; the points were not updated
+after the pose was edited) and one frame each in one cutscene (EV1034),
+listed as `foot_points` = `{bone: [[frame, x, y, z], …]}`. Track −4 holds
+contact flags (x for the foot of −2, y for −3; its z is never read): a flag
+is 1 exactly while the foot is planted. Hewie's rigs use −5 (hind paws J32,
+J33) and −6 (front paws J10, J11) instead. The game uses them to fit planted
+feet to the floor (contact query `0x1F8B50`, leg adjustment for Hewie at
+`0x1F8450`). Exported as `foot_contact` = `{bone: [[first frame, last frame],
+…]}` in the clip extras; the asset extras (`foot_controls`) say which bones
+each track refers to. `tools/blender_markers.py` turns the contacts into
+stepped `contact_<bone>` curves.
+
+### Animation markers (MRK files)
+
+*36 files. Exported per clip as the extras `markers`.*
+
+`O_*/*.MRK`: `u32` count, count × `u32` animation id (same ids and order as
+the model's lookup table), count × `u32` absolute offset (0 = none; clips
+may share data), then one byte per frame, padded to 4 bytes. The game reads
+the byte of the current frame (`0x1F4770`) and tests single bits:
+
+* **Bits 4 and 8: hand poses** for hand 1 and hand 2 (code `0x2DCB40`). At
+  the start of a clip both hands go to their resting shape; each marked frame
+  switches that hand between its resting shape and a target shape, easing
+  over the four frames before the mark. The target shape comes from a table
+  per animation (Fiona's costumes: 120 rows, Debilitas: 85 rows). Exported as
+  `hand_poses` (`[frame, A, B, mix]` per hand) and, in full character files,
+  as hand blend-shape weight keys. Other characters' bits 4 and 8 are not
+  read by this code.
+* **Bits 1, 2, 16, 32: gameplay cues.** Bit 1 (one frame per clip) gives a
+  pursuer a 50 % chance to send a cue (an event other game code reacts to)
+  at its position; bit 2 sends a
+  request to the actor-interaction code once per clip; bits 16 and 32 are
+  tested by character state code. Their exact effects are not named.
+
+---
+
+## 4. Rooms (PAC)
+
+*168 files. Exported as `stages/<folder>/<room>.glb`, plus
+`<room>_navmesh.glb` (walkable floor) and `<room>_zones.glb` (script
+triggers). Rendering a room through the game's own camera reproduces an
+in-game screenshot almost pixel for pixel.*
+
+A PAC file starts with a 0x800-byte table of offsets, one per *slot*; each
+slot's data ends where the next different offset begins.
+
+| Slot | Contents | Exported as |
+| --- | --- | --- |
+| 0 | navigation floor triangles | navmesh file |
+| 1 | the floor's open edges (walls) | `walls` in the navmesh file |
+| 2 | trigger lines and areas for room scripts | zones file |
+| 3 | room geometry | room meshes |
+| 4 | character lighting | lights and `character_lighting` extras |
+| 5 | gameplay camera start settings | camera nodes |
+| 6 | gameplay camera paths | camera `_rail` clips |
+| 7 | door placements | door nodes |
+| 8 | door meshes | door nodes |
+| 9 | textures | room materials, `textures/ST_xxx/` |
+| 10 | room text | `text/rooms/` |
+| 11 | a table that is empty in every room | — |
+| 12 | named (movable) objects | `<room>_objNNN_<name>` nodes |
+| 13 | screen effects (fog, colour filter, depth effect) | `room_effects` extras |
+| 14 | switchable floor groups | `floor_groupNN` in the navmesh file |
+| 15 | authored object motion | `<object>_motion<k>` clips |
+| 16 | per-triangle navigation overrides | navmesh file |
+
+### Geometry (slot 3) and draw records
+
+Room geometry, doors and rigid named objects use the same **draw record**:
+
+```
+i32 vertex count, i32 texture, u32 control, i32 extra
+f32[16] matrix (row-major; translation in elements 3, 7, 11)
+UVs 2×f32 | align to 16 | colours 4×u8 (0x80 = 1.0) | align | positions 3×f32 + u32 (bit 15 = strip restart)
+```
+
+Slot 3 starts with six group offsets; each group is a run of records ended
+by `−1, −1`. Groups 0–2 are normal geometry, group 4 animated textures,
+group 5 blended effects drawn without depth writes (`extra` bit 8 =
+additive). Control bit 0 turns on alpha blending; the top byte is a
+**visibility selector** that event scripts switch on and off (0 = always
+visible). Objects with a selector are exported in `…_selNNN` nodes with the
+`visibility_selector` extra.
+
+The vertex colours carry the room's painted-in lighting (0x80 = full
+brightness); the export converts them to linear `COLOR_0` and uses unlit
+materials. Transparency follows the same per-triangle rules as for
+characters, with the vertex alpha taken into account (fades never become
+opaque); baked floor shadows and effects stay blended.
+
+### Animated textures
+
+Group 4 records are quads whose UVs show one cell of a texture atlas. The
+control word holds the cell count (bits 16–23), `extra & 15` how many frames
+each cell stays, and `(extra >> 4) & 15` a mode (2 = play once and hold the
+last cell; others loop; some modes also pick blend setups). The game
+advances a cell every `hold` drawn frames (`0x25CB50`); every shipped atlas
+has hold 1 and modes 0 or 6, so they run at 30 cells per second. Exported as
+`<room>_atlasNN` with one child per cell and a looping clip.
+
+### Doors
+
+Slot 7 holds 8 offsets to door placements: `i32 resource, f32[3] position,
+f32[3] second point, f32[3] Euler angles`, then two counted id lists. Slot 8
+holds 8 `i32` values; door *i*'s meshes start at `slot start + value + 16·i`
+and are runs of draw records ended by 16 bytes of `0xFF`.
+
+**Door curves** (`O_*/*_D000.MTN`): count, offsets, then per curve 3 floats,
+a sample count and one yaw angle (degrees) per game update. Even curves open
+(0 → −90°), odd ones close. Every character who opens doors has a bank:
+Fiona (8 curves, used for the room door clips) and the pursuers DB1, DB2,
+DNL, LRF, LRO, LRY, RCG and RCT (4 each). The game keeps the player's bank
+and the current pursuer's bank loaded and picks a curve pair in gameplay
+code. Pursuer banks are exported once as `misc/doors/X_D000.glb` (clips on a
+`door` pivot that turns about +Y, added to the door's own angle), or into a
+room with `stage --pursuer-doors`.
+
+### Textures (slot 9)
+
+Count, then 16-byte descriptors (format, width, height, pixel size, palette
+size, and flags whose upper 24 bits are the data offset), then 8-bit indices
+and a CSM1 palette per texture.
+
+### Named objects (slots 12 and 15)
+
+Slot 12: four category counts, 16 bytes padding, offsets. Each object has a
+16-character name, Euler angles at +0x10, a translation at +0x20, then either
+one rigid draw record (category 2) or two packed shapes (category 3:
+`3×i16` + origin, divided by 128, colours per shape, `2×u16/32768` UVs, byte
+strip markers), exported as a mesh with one blend shape.
+
+Slot 15 holds authored motion for some of them: `u32` count, offsets to
+`name[16], u32 channel count, u32 table offset`; channels are `u32 frames,
+u32 type, u32 data offset` with type 7 = Euler + position (6 floats), 8 =
+Euler, 9 = position, as absolute transforms per game update. 29 objects in 15
+rooms (levers, drawers, door pairs, a lid, spikes, a statue, a tadpole);
+exported as `<object>_motion<k>` clips.
+
+### Gameplay cameras (slots 5 and 6)
+
+Slot 5 has 32 bytes per camera: start position, horizontal field of view in
+degrees (60), target. Slot 6: count, then pairs of curve and key counts;
+16-byte aligned 32-byte cubic keys (parameter, value, 4 handle values, mode,
+word). Each camera has six curves (position x, y, z and target x, y, z) of
+eleven keys over a progress value from 1 to 100. Exported as cameras with a
+`_rail` clip that runs the progress at one step per frame. The game's field
+of view is horizontal; exported cameras use the matching vertical value for
+4:3.
+
+### Character lighting (slot 4)
+
+*Exported as `KHR_lights_punctual` lights under `<room>_lights`, the
+ambient colour as `character_lighting` in the room's extras and the
+per-triangle masks as `light_masks` in the navmesh file.*
+
+Rooms are lit by the artists' painted vertex colours; only characters are
+lit at run time. Layout: `u32` count (up to 16), `f32` ambient RGB, then
+48-byte lights: `f32 x, y, z, 1; f32 R, G, B, w; f32 range, 1/range,
+range², param` (colours on a 0–255 scale, `w` an intensity multiplier, mostly
+0.3–1.4). Range 0 means a directional light coming from the stored point.
+Each floor triangle's last word (+76) is a 16-bit mask of the lights that
+may reach a character standing on it; the game uses the three strongest of
+those (strength = (0.3 R + 0.6 G + 0.1 B) × w × (range − distance) / range).
+882 lights in 166 rooms (795 point, 87 directional). The export assumes the
+game's full value of 128 equals 2000 lux and matches the game's linear
+falloff at half the range (at most 2.5 m), so wide lights are not too bright
+up close.
+
+### Navigation and triggers (slots 0, 1, 2, 14, 16)
+
+* **Slot 0, floor:** `u32` count, 12 bytes padding, 80-byte triangles (three
+  `float4` corners, three `i32` neighbours, `u32` flags, three centroid
+  distances, the light mask). Slot 16 has one override byte per triangle.
+* **Slot 1, walls:** `u32` count, 12 bytes padding, 16-byte records
+  `u32 triangle, u32 edge e, u32 corner e, u32 corner (e+1) mod 3`: the
+  floor's open edges. The game intersects movement and sight lines with
+  them (`0x17B9B0`) and stops at the nearest. 14,728 records. Exported as a
+  `walls` line mesh in the navmesh file.
+* **Slot 2, triggers:** a table of offsets (the index is the number room
+  scripts use) to records `u32 type, 0, f32 height, 0` followed by points;
+  type 0 is a line the player can cross, type 1 a four-cornered area. 1,188
+  lines and 1,105 areas, exported as `<room>_zones.glb`.
+* **Slot 14, floor groups:** `u32` group count, offsets, then groups of
+  triangle numbers that scripts switch on and off together. 223 groups,
+  exported as `floor_groupNN` nodes in the navmesh file.
+
+### Screen effects (slot 13)
+
+Offsets at +8, +12, +16 and +20 to the settings of four screen effects: two
+colours and a mode (effect 31), a colour filter (effect 30), fog (effect 29,
+same layout as the cutscene fog below) and a depth effect (effect 28, as in
+cutscenes). Two rooms point past the end of their file; those values read as
+zero. Exported as `room_effects` in the room's extras (not applied to the
+scene).
+
+---
+
+## 5. Cutscenes
+
+*121 events with 832 shots. Exported as `cutscenes/<event>/<event>.glb`
+with the soundtrack and movie layer. Timing verified against the audio:
+30 frames per second.*
+
+Each event folder holds a timeline (`.DH`), the animation data (`.DP`),
+per-frame flags (`MARK.BIN`), per-shot settings (`PARAMS.BIN`) and a movie
+with the soundtrack (`.SFD`).
+
+### Timeline (DH)
+
+`u16 frames, u16 shots`, then 8 × `u32` offsets of prop-group name lists (0
+= none; each list is `u32 count, count × char[16]`, the names of the
+objects DP sections 40–47 move; exported as `prop_groups`). From 0x24, one
+12-byte record per shot: `u32 mask` (bit 0 = camera, bit *n* = actor slot
+*n*), `u8 extra mask` (bit 0 = DP section 32 props), `u8 prop-group mask`,
+`u16 0`, `u16 start, u16 end` (frames).
+
+### Animation data (DP)
+
+48 section offsets. Section 0 is the camera (`type, frames, data offset, 0`,
+then per frame: position, target, field of view in radians, roll). Sections
+1–31 are the actors' animations, one motion bank each (the slot number is
+the section number). Sections 32 and 40–47 are named prop tracks: `count`,
+28-byte descriptors (frames, type 2, data offset, `name[16]`), then 24-byte
+samples (Euler + translation), or 12-byte Euler samples in section 32. All
+831 DH/DP pairs agree on frame counts and actors.
+
+**Actor slots** (from the game's actor table): 1 the player (her current
+outfit), 2 Hewie, 3 DB0, 4 DNL, 5 RCG, 6 LRM, 7 LRY, 8 LRO, 9 LRF, 10 GLM,
+11 FIN_200, 12 FIW_200, 13 and 14 CRW, 15 WHC, 16 SGM, 17 FS0, 18 RCT,
+19 SHT, 20 WIR, 21 DNT, 22 LRC, 23 LRH, 24 FIM_200, 25 HND.
+
+Slot 1 is the live player object, so it shows whatever Fiona is wearing.
+Before her change of clothes the player is a separate class whose model is
+`O_FIS/FIS_000.PCK`: EV0002 and the first shots of EV0003 show FIS, and
+EV0003 continues with slots 12 (FIW_200) and 11 (FIN_200).
+
+Props whose names match one of the room's named objects animate that
+object (exported under the room stand-in with the room object's name); the
+others are exported as `prop_<name>` empties.
+
+### Which room a cutscene plays in
+
+Cutscene files do not say which room they belong to. The game's room
+handlers list the events they play: room slot *k* is installed by the code at
+`0x20A5C8 + 16k`, and the slots map in order to the game's room numbers
+0x00–0x37, 0x40–0x70, 0x80–0x88, 0x8A, 0x8C–0x8F, 0x91–0x9B, 0xC0–0xC8,
+0xD0–0xD9, 0xE0–0xE9 and 0x100–0x10B (171 rooms). `tools/derive_event_rooms.py`
+reads this from the game's program into `hgexport/data/event_rooms.json`.
+The exporter then checks each shot's actor positions against the room's
+walkable floor (733 of 831 shots confirmed, 18 moved to a neighbouring room
+of the same folder, 80 camera-only shots follow the previous one, 30 death
+scene shots with actors lying down keep the listed room).
+
+### Per-frame flags (MARK.BIN)
+
+One `u16` per event frame (a few DE files are 136-frame placeholders).
+Exported as `marks`, plus the decoded `vibration` and `script_sync`.
+
+* **Bit 0:** camera cut (743 of 770 fall exactly on a DH shot start).
+* **Bit 2:** small vibration motor on. **Bits 3–4:** large motor strength
+  (0, 85, 170 or 255). Sent to the controller whenever they change; used
+  mostly in death scenes.
+* **Other bits** are counted per frame and serve as sync points for the
+  event's script, which waits for a given bit (bits 1 and 5–15; bit 11 also
+  toggles a game flag). The scripts are compiled into the game's program,
+  so what each sync point triggers is not decoded. Exported as
+  `script_sync` (`[frame, [bit numbers]]`).
+
+### Per-shot settings (PARAMS.BIN)
+
+`u32` count, 12 bytes padding, 48-byte records `u8 1, u8 type, u16 shot, 12
+bytes padding, 32 bytes data`, applied at the start of the shot (code
+`0x2CA130`). Exported as `cut_parameters`.
+
+* **Type 0, character lighting** (700 records): room light colours are
+  scaled by `+24`, the ambient colour `+20` is added, and up to two
+  directional lights (colours `+16` and `+36`, angles `+28, +32` and
+  `+40, +44`) replace room light slots 2 and 1. A light's direction is the
+  camera's view direction turned by the first angle about the camera's
+  horizontal axis and by the second about the world's up axis. The Blender
+  script applies this.
+* **Type 1, depth effect** (62 records): four distances, probably
+  depth-of-field ranges.
+* **Type 2, fog** (285 records): two colours, start and end distance, and
+  some unexplained values.
+
+### Movie and soundtrack (SFD)
+
+An MPEG-2 stream with CRI ADX audio (FFmpeg reads it). Event movies carry
+the cutscene's soundtrack plus a picture that is black except where it has
+content. There are two kinds:
+
+* **Inserts** (512×224 movies in EV0002, EV0004, EV0005, EV0008, EV0021):
+  full-screen pre-rendered shots. Their non-black stretches coincide
+  exactly with shots that have only a camera and no actors or props; the
+  game shows the film instead of the 3D view there.
+* **Overlays** (256×224, all other events): effects drawn over black
+  (smoke, glass sparkles, fire, lightning, X-ray views), laid over the 3D
+  view.
+
+Exported as a lossless WAV (the soundtrack) and a video-only MP4, described
+by `movie` in the cutscene's extras: `mode` (`inserts` or `overlay`),
+`content_frames` (non-black frame ranges) and, for inserts, `insert_cuts`.
+
+---
+
+## 6. Sound and music
+
+* **ADX** (voices, effects, cutscene audio): CRI ADPCM with 18-byte blocks
+  per channel and loop points in the header. The decoder's output is
+  bit-identical to FFmpeg's. Exported as WAV with loop points.
+* **HD/BD sound banks:** Sony's bank format. The `.HD` holds chunks named
+  `Vers`, `Head`, `Vagi`, `Smpl`, `Sset`, `Prog`; `Vagi` lists each sample's
+  offset in the `.BD`, sample rate and loop flag. The `.BD` is PS-ADPCM
+  (16-byte frames of 28 samples, flags 1 = end, 2 = loop, 4 = loop start).
+  **Instruments:** `Prog` lists programs (split table, volume, pan, …),
+  20-byte splits (sample set, key range, pitch bend, key follow, volume,
+  pan, transpose, detune), `Sset` sample sets (velocity range, samples),
+  42-byte `Smpl` records (sample, root note at +0x0B, detune, pan, volume at
+  +0x10, SPU2 envelope at +0x12). Exported as WAVs per sample and, for music
+  banks, as a SoundFont (`.sf2`).
+* **SQ music sequences:** Sony's sequence format. The `IECSidiM` chunk holds
+  a MIDI stream with two twists: when bit 7 is set on an event's last data
+  byte, the next event has no delay value, and note-off events carry only
+  the key. Loop points are NRPN 99 set to 0 and 1. Exported as MIDI with
+  loop markers and as a rendered WAV.
+* **SDT sound-effect tables** (130 files, one per effect bank): 16-byte
+  records, the effect id is the record number, all-zero records are unused
+  (1,143 used). Byte 0 version (1); byte 2 priority (bits 0–6) and tie rule
+  (bit 7); byte 3 voice (bits 0–5) and, in bit 7, "the next record plays as
+  another layer"; byte 4 pan (bits 0–6, used when bit 7 is set; 0, 64, 127 =
+  left, centre, right); byte 5 volume offset (signed); byte 6 transpose
+  (signed); byte 8 program; byte 9 sample (the program's split for key
+  12 + n); byte 10 unused. Exported next to the bank's WAVs as
+  `<bank>_effects.json`. Three effects of `ST1_058` name samples the bank
+  does not have.
+* **Reverb:** the game switches on the sound chip's "studio B" reverb at
+  volume 0 and never raises it, so music plays without reverb. The rendered
+  WAVs match that.
+* **Movies (SFD):** see [the cutscene movie](#movie-and-soundtrack-sfd).
+  Stand-alone movies are exported as MP4 with AAC audio.
+
+---
+
+## 7. Text
+
+`SUBSCR/MSG_*.BIN` and room slot 10: `u16` highest message number, `u16`
+offsets, then zero-terminated ASCII text. Control bytes: 0x01 new line, 0x02
+new page, 0x03 and 0x04 highlighting codes. Exported as JSON and
+plain text.
+
+---
+
+## 8. Other files
+
+### GAME_FIX.GFM (always-loaded props)
+
+*Exported as `misc/GAME_FIX.glb`.*
+
+Four small props the game keeps loaded, drawn with `GAME_FIX.TEX` image 2:
+a hanging ring with a pendulum over an octagonal floor symbol and a soft
+ground disc (about 2.2 × 1.3 m), two small gems and a small hooded figure
+(about 0.5 m).
+
+* `u32` entry offsets (4; the first equals the table size). An entry is a
+  chain of parts, each aligned to 16 bytes after the previous one. A part
+  header holds the vertex count *n*, a palette number, the part count (in
+  the first part), 0, four offsets (UV, colour, position, flag arrays) and a
+  start position (`i32 x, y, z, w`).
+* **UV:** *n* × `u16 s, t`, divided by 32768 over the 512×256 image.
+  **Colour:** *n* × RGBA bytes (0x80 = 1.0). **Position:** *n* × `i16 x, y, z`
+  differences, each vertex adding to the previous one, starting from the
+  header's position; divide by 16. **Flag:** *n* bytes; 1 = no triangle ends
+  at this vertex.
+* Drawn as blended triangle strips. Only the palette changes between parts:
+  palette 1 is the natural colouring, 2–6 are tinted versions (palette 5
+  also fades the alpha). Exported with the palettes as material variants;
+  each variant uses the transparency mode right for its palette.
+
+### OBSTACLE.MTN
+
+A single 30-sample curve (0 → 0.77 → 0): `u32` count, `u32` offsets, then
+per curve `u32 n` and *n* floats. Gameplay code uses it while the player
+plays a certain group of animations near specially flagged floor; the flag
+is set while the game runs, not stored in any file. Because it only makes
+sense inside gameplay, it is exported raw as `misc/OBSTACLE.json`.
+
+### Memory-card icon
+
+*Exported as `misc/ICON00.glb` (animated model) and
+`textures/SUBSCR/ICON00.png` (texture).*
+
+`SUBSCR/ICON.SYS` and `SUBSCR/ICON00.ICO` are the standard PlayStation 2
+memory-card browser formats. `ICON.SYS` holds the save's title in Shift-JIS
+(ＨＡＵＮＴＩＮＧ ＧＲＯＵＮＤ), background colours and lights (all zero),
+ambient light 0.3 and the icon file names. `ICON00.ICO` holds 6 shapes of
+1,338 vertices (446 triangles; `i16/4096`, Y pointing down), normals, UVs,
+a constant vertex colour, a 60-frame loop that blends shape 5 → 4 → … → 0,
+and a 128×128 16-bit texture. It shows Hewie walking. Exported Y-up, with
+shape 0 as the mesh, shapes 1–5 as blend shapes, the loop as weight keys at
+60 frames per second (the browser's rate) and `ICON.SYS` in the extras.
+
+### Frame rate
+
+The game counts video fields (60 per second) and only shows a new frame
+after at least two have passed (`0x1BEEF0`), so it renders at most 30
+frames per second. Animations, cutscenes and animated textures are all
+exported at 30 frames per second.

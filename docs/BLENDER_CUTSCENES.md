@@ -1,0 +1,424 @@
+# Assembling a cutscene in Blender
+
+*Haunting Ground* plays most of its cutscenes in real time: the game takes
+the same character models and rooms you walk around in, and animates them
+with a camera, character movement and moving props. The exporter keeps it
+that way. A cutscene file (`cutscenes/EVxxxx/EVxxxx.glb`) contains only
+what is unique to that cutscene:
+
+* the camera, with its movement and zoom,
+* the movement of every character in it (body, face and hands),
+* the movement of props.
+
+The characters and rooms are not copied into it; they are the same files you
+find in `characters/` and `stages/`. This guide shows how the pieces
+connect and how to put them together into one scene, either with one
+command (section 2) or by hand (section 3).
+
+You need **Blender 4.4 or newer** (tested with 5.2). Older versions lack
+*action slots*, which the cutscene animation relies on (explained below).
+
+> **Just want one file?** Export the cutscene with everything inside:
+> `python -m hgexport cutscene EVxxxx out.glb --embed-models`, then import
+> that single file. It is larger (characters and rooms are repeated in every
+> cutscene) and you lose the extras the script adds (physics, sound, movie,
+> lighting), but it needs no assembly.
+
+---
+
+## 1. How the files connect
+
+### The files of one cutscene
+
+Taking the cutscene `EV0014` (dinner with Daniella) as an example:
+
+| File | What it holds |
+| --- | --- |
+| `cutscenes/EV0014/EV0014.glb` | the camera; one *stand-in* skeleton per character; one *blend-shape carrier* per character; empty *stand-ins* for the room and for every room object a prop moves; one animation (`EV0014`) that moves all of them |
+| `cutscenes/EV0014/EV0014.wav` | the complete soundtrack (voices, music, effects), starting at frame 0 |
+| `cutscenes/EV0014/EV0014.mp4` | the cutscene's movie layer, same length, no sound. It is black except where the game shows video: either full-screen pre-rendered shots that replace the 3D view (in EV0002, EV0004, EV0005, EV0008, EV0021) or effects laid over the 3D view (smoke, sparkles, fire). The extras of the cutscene say which kind it is and when it has content |
+| `characters/O_FIN/FIN_000.glb` | Fiona: mesh, skeleton (`FIN_000_skeleton`), blend shapes, her gameplay animations, alternative texture sets |
+| `characters/O_DNL/DNL_000.glb`, `characters/O_DNT/DNT_000.glb` | the other characters, built the same way |
+| `stages/ST_010/ST_011.glb` | the room: geometry, doors, movable objects, gameplay cameras |
+
+A **stand-in** is a placeholder in the cutscene file with the same name and
+structure as the real object, so that its animation can be handed over.
+
+### Everything is linked by name
+
+The cutscene stores which file each stand-in belongs to as a *custom
+property* (in Blender: *Object Properties > Custom Properties*):
+
+```
+EV0014.glb                                    other exports
+──────────                                    ─────────────
+EV0014                (empty, scene root)
+├─ EV0014_camera      camera, animated
+├─ A01_FIN_000        stand-in skeleton   ──► characters/O_FIN/FIN_000.glb
+│  │  model_file      = characters/O_FIN/FIN_000.glb
+│  │  texture_variant = cutscene
+│  │  hidden_parts    = [Inquisitor Earrings, ...]
+│  │  bones J00, J01 ...                      same names as in FIN_000_skeleton
+│  └─ A01_FIN_000_blendshapes  tiny mesh with the face and hand shape keys
+│                                             same names as on the FIN_000 mesh
+├─ A04_DNL_000 ...
+├─ ST_011             empty stand-in      ──► stages/ST_010/ST_011.glb (its root is also "ST_011")
+│  │  room_file       = stages/ST_010/ST_011.glb
+│  └─ ST_011_obj000_spoon   empty, animated  ──► room object "ST_011_obj000_spoon"
+└─ prop_doornull0     empty, animated      a prop with no matching room object
+```
+
+`A01` is the character's slot number in the cutscene. `model_file` and
+`room_file` are paths relative to the export folder.
+
+### How the animation is stored
+
+All animation of a cutscene is **one Blender action** named after it
+(`EV0014`). Since Blender 4.4 one action can animate several objects; each
+object's part of it is a **slot**, named after the object it was made for:
+
+| Slot | Animates | Give it to |
+| --- | --- | --- |
+| `EV0014_camera` | camera position and rotation | (already on the camera) |
+| the camera data's slot | the lens (zoom), changing at each cut | (already on the camera) |
+| `A01_FIN_000` | every bone of Fiona, and whether she is visible | the `FIN_000_skeleton` armature |
+| `A01_FIN_000_blendshapes` | her face and hand shape keys | the shape keys of the `FIN_000` mesh |
+| `ST_011_obj000_spoon` | the spoon's position and rotation | the room object `ST_011_obj000_spoon` |
+| `ST_011` (only in cutscenes with several rooms) | whether the room is visible | through parenting, see step 7 |
+
+Two conventions make the hand-over work:
+
+* **Bones have the same names** in the cutscene and in the character file
+  (`J00`, `J01`, …). An action that moves `J05` on the stand-in moves `J05`
+  on the real skeleton. Bones named `X..` are never animated; the game moves
+  them with its physics (cloth, hair, chest).
+* **Visibility is animated as scale.** A character who is not in a shot is
+  scaled to 0 for that shot, and so is a room that is not in use. glTF has
+  no visibility setting that can be animated, so this is the portable way
+  to switch things on and off.
+
+---
+
+## 2. The quick way: one command
+
+`tools/blender_assemble_cutscene.py` does everything in section 3 and adds a
+few things that make the result look like the game:
+
+```bash
+blender --python tools/blender_assemble_cutscene.py -- export/cutscenes/EV0014/EV0014.glb
+```
+
+Blender opens with the finished scene. To save a `.blend` file without
+opening Blender's window:
+
+```bash
+blender -b --python tools/blender_assemble_cutscene.py -- export/cutscenes/EV0014/EV0014.glb --save EV0014.blend
+```
+
+You can also run it from inside Blender: open the script in the *Text
+Editor*, put the cutscene's path into `CUTSCENE = r"..."` near the top
+(a relative path is read from this project's folder) and press *Run
+Script*. Run that way, it adds the cutscene to the file you have open.
+
+Options, all placed after the cutscene path:
+
+| Option | Effect |
+| --- | --- |
+| `--save FILE.blend` | save the assembled scene |
+| `--root DIR` | the export folder, if the cutscene file was moved out of it |
+| `--room-anims ambient\|all\|none` | which room animations to keep (default `ambient`: animated textures and fans loop, doors and curtains stay still) |
+| `--keep-current` | add to the open file instead of starting a new one |
+| `--resolution WxH` | render size (default 1440x1080; the game is 4:3) |
+| `--no-sound` | leave out the soundtrack |
+| `--no-movie` | leave out the movie layer |
+| `--no-cut-lighting` | keep the rooms' lights instead of the per-shot lighting |
+| `--shadows` | let lights cast shadows (the game's do not) |
+| `--blended` | keep Blender's *Blended* mode for character transparency |
+| `--view-transform T` | colour management view (default *Standard*) |
+| `--no-physics` | leave cloth and hair in their rest pose |
+| `--bake-physics` | pre-compute the physics for the whole cutscene |
+
+Renders through the cutscene camera are identical to those of the
+self-contained export (checked on EV0002, EV0014 and DE002F).
+
+### What the script adds
+
+**Sound.** The soundtrack (`EVxxxx.wav`) is placed in the sequencer at
+frame 0, with playback set to follow the audio.
+
+**Per-shot lighting.** The game changes how characters are lit at every cut:
+it scales the room's lights, changes the ambient light and adds up to two
+directional lights that turn with the camera. The script keys the same
+changes (two sun lamps `cut_light0/1` follow the camera). Rooms have their
+lighting painted in, so this only affects characters.
+
+**Game-like rendering.**
+
+* The game's lights cast no shadows, so the script turns shadows off.
+  Otherwise hair strands and low-poly edges throw hard shadows across
+  faces.
+* Characters' transparent materials are switched from *Blended* to
+  *Dithered*. In *Blended* mode, Blender's EEVEE does not sort the
+  transparent triangles of one mesh, so the inside of a hair shell or a
+  skirt shows through its front as jagged triangles. *Dithered* sorts them
+  properly, as the game does. Cycles is not affected.
+* Rooms keep *Blended*. Their transparent parts are mostly soft shadows
+  painted onto surfaces (under plates and cutlery), which must blend over
+  the surface beneath. The script also lifts them 1 mm off that surface so
+  Cycles does not hide them.
+* The colour view is set to *Standard*. Blender's default (AgX) darkens and
+  greys the colours; the game shows them as stored.
+
+**The movie layer.** The movie is put on a plane just in front of the
+camera that fills the frame. If it holds full-screen pre-rendered shots, the
+plane is opaque and shown only during those shots; if it holds effects, it
+is added over the picture throughout (its black adds nothing). A movie strip
+in Blender's sequencer would replace the render, so it is not used.
+
+**Cloth and hair physics.** The game does not animate cloth, hair or chests
+with keyframes; it simulates them while the game runs (see
+[SECONDARY_MOTION.md](SECONDARY_MOTION.md)). The exported files leave these
+bones (the `X` bones) in their rest pose. The script rebuilds the game's own
+simulation, with the game's own settings, as a live Geometry Nodes setup:
+
+* Every character with physics (Fiona's main, early and sheet outfits,
+  Daniella, Riccardo, Lorenzo, Debilitas) gets an object
+  `<character>_physics` carrying the *HG Physics* modifier. Two helper
+  objects follow the body: `…_physics_frames` and `…_colliders`.
+* It covers ponytails and braids, Fiona's skirt, sheet, bangs and bow,
+  Daniella's apron and hair, Riccardo's robe and hair, Lorenzo's coat and
+  hair, a hanging part on Debilitas and the chest movement.
+* It steps once per frame at 30 fps and settles at every cut, the way the
+  game does. Characters off screen stay simulated, as in the game.
+
+Like any Blender simulation it is computed frame by frame. **Play the
+timeline from frame 0, or bake it, before rendering a single frame or a
+range that does not start at 0.** Jumping to a frame restarts the
+simulation there; the result is plausible but only matches the game after
+about 20 frames. To make every frame exact, use `--bake-physics` (EV0004:
+about 7 minutes, 40 MB more in the .blend), or bake in the modifier's *Bake*
+panel. Free the bake there to go back to the live simulation, for example
+after changing the animation. A command-line render of the whole animation
+(`blender -b file.blend -a`) steps through every frame and needs no bake.
+
+Compared with a recording of the game running in an emulator, Fiona's skirt,
+ponytail, bangs, bow and chest and Riccardo's robe and hair follow the game
+to within a millimetre in every visible shot.
+
+**Engines.** In Unity or Unreal the same rendering advice applies: let the
+characters' transparent materials write depth (or use dithered or
+alpha-to-coverage transparency), draw the rooms' transparent materials after
+the opaque ones without depth writes, and switch off shadows from the room
+lights on characters.
+
+---
+
+## 3. Doing it by hand
+
+These are the steps the script performs. Doing them once by hand is the
+best way to understand the setup, and you need them to assemble a cutscene
+into a scene of your own.
+
+### Step 0: Prepare the scene
+
+1. *File > New > General*, then delete the default cube, light and camera
+   (or start from an empty file).
+2. **Set the frame rate to 30 before importing anything:** *Properties >
+   Output > Format > Frame Rate > 30*. The glTF file stores times in
+   seconds, and the importer turns them into frame numbers using the
+   current frame rate. At Blender's default 24 fps, keys land between frames
+   and cuts blur. If you forgot, delete everything and import again.
+3. Use the **same import settings for every file**; the defaults are fine.
+   In particular *Bones & Skin > Bone Dir* must be the same for the cutscene
+   and the characters, because it changes how bone rotations are read.
+
+### Step 1: Import the cutscene
+
+*File > Import > glTF 2.0*, pick `EV0014.glb`. You get the objects shown in
+the diagram above. `Icosphere` objects in the outliner are the importer's
+bone display shapes; ignore them.
+
+Click `A01_FIN_000` and look at *Object Properties > Custom Properties*. It
+tells you which file to import next (`model_file`), which texture set the
+cutscene uses (`texture_variant`) and, for Fiona, which jewellery to hide
+(`hidden_parts`). The room stand-in `ST_011` has `room_file`.
+
+### Step 2: Import a character
+
+Import the file named in `model_file`, e.g. `characters/O_FIN/FIN_000.glb`.
+You get:
+
+* `FIN_000_skeleton`, the armature;
+* `FIN_000`, the body mesh with its shape keys;
+* for Fiona, her jewellery as separate objects (`Default Neck Accessory`,
+  `Jade Choker`, `Inquisitor Earrings`, …);
+* her gameplay animations as actions, stored as **muted** NLA tracks so
+  they do not interfere.
+
+### Step 3: Give the skeleton the cutscene movement
+
+1. Select `FIN_000_skeleton`.
+2. *Properties > Object > Animation*: set **Action** to `EV0014` and
+   **Slot** to `A01_FIN_000`. (The *Dope Sheet > Action Editor* header has
+   the same two fields.)
+
+Scrub the timeline: Fiona now moves like the stand-in, including vanishing
+(scale 0) in shots she is not in. If she stays in her rest pose, the slot is
+still empty; an action without a slot animates nothing.
+
+### Step 4: Give the face and hands their animation
+
+1. Select the body mesh `FIN_000`.
+2. In the *Dope Sheet*, switch the mode to **Shape Key Editor** and set
+   **Action** `EV0014`, **Slot** `A01_FIN_000_blendshapes`.
+
+The tiny mesh `A01_FIN_000_blendshapes` only exists to carry these curves:
+it has the same shape-key names as the body (`face_01`…`face_15`,
+`hand_l_01`…, `hand_r_01`…). Characters without shape keys (e.g.
+`DNT_000`) have no carrier; skip this step for them.
+
+In the Python console (*Scripting* workspace), steps 3 and 4 are:
+
+```python
+import bpy
+O = bpy.data.objects
+
+def take(dst, src):            # dst gets the action and slot that animate src
+    d = dst.animation_data_create()
+    d.action = src.animation_data.action
+    d.action_slot = src.animation_data.action_slot
+
+take(O["FIN_000_skeleton"], O["A01_FIN_000"])
+take(O["FIN_000"].data.shape_keys, O["A01_FIN_000_blendshapes"].data.shape_keys)
+```
+
+### Step 5: Cutscene textures and jewellery
+
+**Textures.** Most characters have a more detailed face texture for
+cutscenes. The character file contains it as a glTF *material variant*
+called `cutscene`; `texture_variant` tells you whether the cutscene uses it.
+Only the face texture (`m00`) changes, but the body uses it in several
+material slots. In the body's *Material* slots, replace every
+`FIN_000_m00_…` material by its twin **`FIN_000_cutscene_m00_…`** (`_opaque`,
+`_mask`, `_blend`). The twins are already in the file after import.
+
+Be careful with the *glTF Variants* panel in the sidebar when several
+characters are in the file: Blender keeps only the variant list of the
+**last** imported file, and *Display Variant* applies to every mesh. After
+importing Hewie (variants `default, hew_201, hew_202`) and then Daniella
+(`default, cutscene, …`), choosing `cutscene` would also switch Hewie to
+`hew_201`. Swapping the materials by hand avoids this (the script does so
+after each import). In the console, for one character:
+
+```python
+for s in O["FIN_000"].material_slots:
+    if s.material:
+        twin = bpy.data.materials.get(s.material.name.replace("FIN_000_", "FIN_000_cutscene_", 1))
+        if twin:
+            s.material = twin
+```
+
+**Jewellery and the glass shard.** Fiona's file contains all her unlockable
+earrings and chokers as separate objects, and Daniella's has her glass shard
+as the object `Glass Shard`. Cutscenes show only Fiona's default neck
+accessory and no shard: hide the objects listed in `hidden_parts` (both the
+eye and the camera icon in the outliner), or delete them.
+
+### Step 6: Hide the stand-ins, repeat for every character
+
+Hide `A01_FIN_000` and its carrier (eye and camera icons), or delete them.
+The action stays, because the real skeleton now uses it. Repeat steps 2 to 6
+for every `Axx_…` object.
+
+### Step 7: The room
+
+1. Import the file named in `room_file` (`stages/ST_010/ST_011.glb`). Its
+   top object is also called `ST_011`, so Blender renames it
+   **`ST_011.001`**. That is expected; everything inside keeps its name.
+2. Parent it to the stand-in: click `ST_011.001`, Shift-click the stand-in
+   `ST_011`, *Ctrl+P > Object (Keep Transform)*. Both sit at the origin, so
+   nothing moves. Some cutscenes use several rooms (EV0002 uses ST_020 and
+   ST_021); they overlap at the same place, and this parenting is what shows
+   the right one in each shot. Do it for every room.
+3. Rooms come with their gameplay animations (doors, curtains, the gameplay
+   camera paths), which do not belong in the cutscene. If any of these
+   objects has an action (*Object > Animation*, or for curtains the mesh's
+   *Shape Key Editor*), clear it with the X button. Hide the room's own
+   cameras (`ST_011_cam0`, …).
+4. Animated textures (`ST_xxx_atlasNN`) and fans (`…_fan…`) come with one
+   cycle of their loop. To keep them running, select them, open the *Graph
+   Editor*, select all channels and use *Channel > Extrapolation Mode > Make
+   Cyclic (F-Modifier)*.
+
+### Step 8: Props
+
+Every empty under the room stand-in (such as `ST_011_obj000_spoon`) carries
+the movement of the room object with the same name. Select the room's object
+(`ST_011_obj000_spoon.001` if the name clashed) and in *Object > Animation*
+set **Action** `EV0014`, **Slot** `ST_011_obj000_spoon`. Then hide the empty.
+Outside the shots that move it, the object stays where the room file puts it.
+
+Empties named `prop_…` directly under the cutscene root are props without a
+room object (spots the game used to place effects or attached items). They
+are already animated: parent anything you like to them, or ignore them.
+
+### Step 9: Camera, timing and sound
+
+1. **Active camera:** select `EV0014_camera`, *View > Cameras > Set Active
+   Object as Camera* (Ctrl+Numpad 0).
+2. **Picture shape 4:3:** *Output > Format > Resolution* 1440 × 1080 (or
+   640 × 480). The game rendered 4:3 and the camera's zoom is set for that.
+   A 16:9 picture shows more at the sides than the game did.
+3. **Frame range:** start at **0**, end at the last key of the action (for
+   example 3488 for EV0002; `manifest.json` lists every cutscene's length).
+4. **Sound:** in the *Video Editing* workspace, *Add > Sound*, pick
+   `EV0014.wav` and place it at frame 0. Set the timeline's *Playback >
+   Sync* to **Sync to Audio**. For the movie layer, see *The movie layer* in
+   section 2.
+
+Press play. Cuts happen instantly, characters appear and disappear with
+them, and props move inside the room, as in the game.
+
+### Optional: markers and per-shot data
+
+The cutscene's root object (`EV0014`) carries more data as custom
+properties: `marks` (per-frame flags; bit 0 marks a camera cut),
+`cut_parameters` (per-shot lighting, fog and depth effect, explained in
+`cut_parameters_note`), the controller vibration and more. To see the marks
+on the timeline, and the characters' animation markers in the Action Editor,
+run:
+
+```bash
+blender --python tools/blender_markers.py -- export/cutscenes/EV0014/EV0014.glb export/characters/O_FIN/FIN_000.glb --import
+```
+
+---
+
+## 4. Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| A character stands in its rest pose | The action is set but its **Slot** is empty (step 3) |
+| Motion stutters, cuts blend over a frame | The frame rate was not 30 when importing; set it and import again (step 0) |
+| Limbs twist oddly | Different *Bone Dir* import settings for cutscene and character (step 0) |
+| The face does not move | The shape-key action or slot is not set on the body mesh (step 4) |
+| Wrong textures after using the glTF Variants panel | The variant list belongs to one import; swap materials by hand (step 5) |
+| Earrings, chokers or Daniella's shard appear where the game shows none | Hide the objects listed in `hidden_parts` (step 5) |
+| A shot shows the room or an empty view where the game shows a pre-rendered film | The movie layer is missing (section 2, *The movie layer*) |
+| Colours darker and greyer than in the game | The view transform is AgX; use *Standard* (*Render Properties > Color Management*) |
+| Two moons, stray glass shards or props the game does not show | Room objects named `…_selNNN` (custom property `visibility_selector`) are switched on and off by the game's event scripts, which are not decoded, so all are shown. Hide the ones the shot does not need (EV0018: `ST_060_main_sel023` is the second moon, `ST_060_effects_sel021` the glass debris before the dome breaks) |
+| Two rooms on top of each other | The rooms are not parented to their stand-ins (step 7) |
+| Doors swing or curtains move on their own | Clear the room's gameplay actions (step 7) |
+| A prop does not move | Give the prop's slot to the room object, not to the empty (step 8) |
+| The picture is wider than the game's | The resolution is not 4:3 (step 9) |
+| Cloth or hair jumps or looks wrong on a single frame | The physics was not played from frame 0; play from the start or bake (section 2) |
+| Objects named `….001` | Normal: stand-ins and real objects share names on purpose |
+
+## 5. Other programs
+
+The same three links work in Unity, Unreal or any glTF tool: bones match by
+name, shape keys match by name, and room objects match by object name.
+Engines that bind animation to an object's *path* in the hierarchy (Unity's
+Animator, for example) need the clip's paths changed from the stand-in
+(`A01_FIN_000/...`) to the character's own hierarchy; there, the
+self-contained export (`--embed-models`) is the simpler choice.
