@@ -112,6 +112,9 @@ class MaterialFactory:
         self._rgba: dict[int, bytes] = {}
         self._samplers: dict[bool, int] = {}
         self._samplers_alpha: dict[int, AlphaSampler] = {}
+        self.shine: dict[int, bytes] = {}   # component -> grey shine mask (export/shine.py)
+        self.specular = False               # put the shine masks into the materials
+        self._shine_tex: dict[int, int] = {}
 
     def rgba(self, component: int) -> bytes:
         if component not in self._rgba:
@@ -134,6 +137,25 @@ class MaterialFactory:
                 image = self._images[component] = self.b.image(png, f"{self.prefix}_tex{component:02d}")
             self._tex[key] = self.b.texture(image, self._samplers[repeat])
         return self._tex[key]
+
+    def shine_texture(self, component: int) -> int:
+        """One texture for KHR_materials_specular (alpha: specular, the shine
+        strength relative to the sheet's strongest) and the metal/roughness slot
+        (green: roughness of the game's broad highlight where shiny, 1
+        elsewhere; blue: metal 0)."""
+        if component not in self._shine_tex:
+            from .shine import SHINE_ROUGHNESS
+            img, mask = self.images[component], self.shine[component]
+            rough, top = round(SHINE_ROUGHNESS * 255), max(mask)
+            px = bytearray(4 * len(mask))
+            for i, v in enumerate(mask):
+                px[4 * i + 1] = rough if v else 255
+                px[4 * i + 3] = round(255 * v / top)
+            image = self.b.image(encode_png(img.width, img.height, bytes(px)), f"{self.prefix}_shine{component:02d}")
+            if False not in self._samplers:
+                self._samplers[False] = self.b.sampler(wrap_s=CLAMP, wrap_t=CLAMP)
+            self._shine_tex[component] = self.b.texture(image, self._samplers[False])
+        return self._shine_tex[component]
 
     def sampler(self, component: int) -> AlphaSampler | None:
         if not 0 <= component < len(self.images):
@@ -168,6 +190,23 @@ class MaterialFactory:
                 # The GS alpha test passes any non-zero alpha (ATST=NOTEQUAL, AREF=0).
                 mat["alphaCutoff"] = TEST_CUTOFF
             mat["extras"] = {"source_texture": self.sources[component]}
+            if self.specular:
+                # the game's shine (export/shine.py): specular only where the parts shine
+                # (the sheet's strongest shine sets the reflectance through the IOR)
+                ext = mat.setdefault("extensions", {})
+                if component in self.shine:
+                    from .shine import f0_ior, shine_f0
+                    tex = self.shine_texture(component)
+                    mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": tex}
+                    # tinted by the texture, as the game's glow brightens the
+                    # frame by its own colour (dark cloth stays dark, detail stays)
+                    ext["KHR_materials_specular"] = {"specularFactor": 1.0, "specularTexture": {"index": tex},
+                                                     "specularColorTexture": {"index": self.texture(component, repeat)}}
+                    ext["KHR_materials_ior"] = {"ior": round(f0_ior(shine_f0(max(self.shine[component]))), 3)}
+                    self.b.extensions_used.add("KHR_materials_ior")
+                else:
+                    ext["KHR_materials_specular"] = {"specularFactor": 0.0}
+                self.b.extensions_used.add("KHR_materials_specular")
         if self.unlit:
             mat.setdefault("extensions", {})["KHR_materials_unlit"] = {}
         if extras:

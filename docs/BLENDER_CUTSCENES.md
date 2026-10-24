@@ -64,8 +64,9 @@ EV0014                (empty, scene root)
 ├─ A04_DNL_000 ...
 ├─ ST_011             empty stand-in      ──► stages/ST_010/ST_011.glb (its root is also "ST_011")
 │  │  room_file       = stages/ST_010/ST_011.glb
-│  └─ ST_011_obj000_spoon   empty, animated  ──► room object "ST_011_obj000_spoon"
-└─ prop_doornull0     empty, animated      a prop with no matching room object
+│  ├─ ST_011_obj000_spoon   empty, animated  ──► room object "ST_011_obj000_spoon"
+│  └─ ST_011_door0          empty, animated  ──► room door "ST_011_door0"
+└─ prop_…             empty, animated      a prop with no matching room object
 ```
 
 `A01` is the character's slot number in the cutscene. `model_file` and
@@ -83,7 +84,8 @@ object's part of it is a **slot**, named after the object it was made for:
 | the camera data's slot | the lens (zoom), changing at each cut | (already on the camera) |
 | `A01_FIN_000` | every bone of Fiona, and whether she is visible | the `FIN_000_skeleton` armature |
 | `A01_FIN_000_blendshapes` | her face and hand shape keys | the shape keys of the `FIN_000` mesh |
-| `ST_011_obj000_spoon` | the spoon's position and rotation | the room object `ST_011_obj000_spoon` |
+| `ST_011_obj000_spoon` | the spoon's position and rotation, and in which shots it is visible | the room object `ST_011_obj000_spoon` |
+| `ST_011_door0` | the door's swing (only in cutscenes that move a door) | the room door `ST_011_door0` |
 | `ST_011` (only in cutscenes with several rooms) | whether the room is visible | through parenting, see step 7 |
 
 Two conventions make the hand-over work:
@@ -131,10 +133,15 @@ Options, all placed after the cutscene path:
 | `--resolution WxH` | render size (default 1440x1080; the game is 4:3) |
 | `--no-sound` | leave out the soundtrack |
 | `--no-movie` | leave out the movie layer |
+| `--no-letterbox` | leave out the black bars over the top and bottom of the picture |
+| `--end-fade` | add the movie gallery's fade to black over the event's last 14 frames |
+| `--start-fade` | add the movie gallery's fade in from black over the event's first 17 frames |
 | `--no-cut-lighting` | keep the rooms' lights instead of the per-shot lighting |
+| `--no-fog` | leave out the game's fog |
 | `--shadows` | let lights cast shadows (the game's do not) |
 | `--blended` | keep Blender's *Blended* mode for character transparency |
-| `--view-transform T` | colour management view (default *Standard*) |
+| `--render-space display\|linear` | render in display values like the PS2 (default `display`), or in Blender's scene-linear light |
+| `--view-transform T` | colour management view (default *Raw* with `--render-space display`, else *Standard*) |
 | `--no-physics` | leave cloth and hair in their rest pose |
 | `--bake-physics` | pre-compute the physics for the whole cutscene |
 
@@ -146,11 +153,58 @@ self-contained export (checked on EV0002, EV0014 and DE002F).
 **Sound.** The soundtrack (`EVxxxx.wav`) is placed in the sequencer at
 frame 0, with playback set to follow the audio.
 
+**Letterbox and end fade.** The game shows every cutscene with black bars
+over the top and bottom eighth of the 4:3 picture (56 of its 448 lines,
+leaving a 16:9 picture); the script adds them last in the compositor, over
+everything (`--no-letterbox` leaves them out). With `--end-fade` it also
+adds the fade to black the movie gallery plays at the end of every event:
+from 14 frames before the end the picture is darkened by 1/16 per frame
+(the event ends at 3/16 and the gallery cuts to black); `--start-fade` adds
+its fade in (black up to frame 1, then 1/16 brighter per frame). Whether
+the story plays the same fades was not checked, so they are off by default.
+
 **Per-shot lighting.** The game changes how characters are lit at every cut:
 it scales the room's lights, changes the ambient light and adds up to two
 directional lights that turn with the camera. The script keys the same
 changes (two sun lamps `cut_light0/1` follow the camera). Rooms have their
 lighting painted in, so this only affects characters.
+
+**Character shading.** The game adds the ambient and its lights into a
+vertex colour (128 = full) and multiplies the texture's on-screen value by
+it, so a character lit at half strength shows half the texture's screen
+brightness. Lighting in linear light, as Blender's materials do, makes the
+same light look much brighter (about twice in dim cutscenes). By default
+(`--character-shading game`) the script gives the characters' materials a
+shading group (*HG Game Shading*) that does it the game's way: the lights'
+diffuse sum (from *Shader to RGB*) plus the cut's ambient, times the texture
+in display values. The lights are set in the game's units for this (a light
+of colour 128 facing a surface gives 1.0) and the world is black, as the
+ambient is in the group. *Shader to RGB* only works in EEVEE; for Cycles use
+`--character-shading physical`, which keeps glTF's lit materials and the
+export's light scale (brighter than the game). The game uses only the three
+strongest lights per character and fades point lights linearly over their
+range; the script uses all of the room's lights with Blender's inverse-square
+falloff, matched to the game's at half the range.
+
+**Display values (render space).** The PS2 draws everything in display
+values: it interpolates the vertex colours across a triangle, multiplies the
+texture by them and blends translucent layers, all on the 0–255 values that
+go to the screen. Blender does these in linear light, which brightens
+exactly the things the rooms are made of: their painted-in lighting is
+mostly dark gradients (interpolated in linear light the middle of a
+gradient from 0 to 40 shows about 28 instead of 20), and their soft light
+falloffs are translucent copies of a surface over a black one (a layer at
+50 % shows at 75 % over black). By default (`--render-space display`) the
+script therefore renders in display values: textures are read raw, the
+vertex colours are stored as display values, the texture × vertex colour
+and the character shading round down to whole 0–255 steps as the GS's
+integer arithmetic does, and so do the compositor's passes. The frame holds
+display values, so the view transform is *Raw* (the viewport and PNG
+renders show the game's values; EXR renders hold display values, not
+scene-linear light). The modern look converts to linear only for its HDR
+lamps, bloom and shoulder. `--render-space linear` keeps Blender's
+scene-linear materials (with *Standard*), and `--character-shading
+physical` needs it.
 
 **Game-like rendering.**
 
@@ -166,8 +220,50 @@ lighting painted in, so this only affects characters.
   painted onto surfaces (under plates and cutlery), which must blend over
   the surface beneath. The script also lifts them 1 mm off that surface so
   Cycles does not hide them.
-* The colour view is set to *Standard*. Blender's default (AgX) darkens and
+* The colour view is set to *Raw* (display values, above) or, with
+  `--render-space linear`, *Standard*. Blender's default (AgX) darkens and
   greys the colours; the game shows them as stored.
+* Highlights are left as exported. The default character files have no
+  specular highlight, as in the game's normal picture. For the game's
+  highlights on skin and metal, export the characters with `--specular`
+  (`python -m hgexport all ... --only-category characters --specular`).
+  The script then uses the materials as they are.
+
+**Screen look and fog.** Each room has a colour mood that the game paints
+over the finished picture: a *tint* (a soft coloured glow plus local
+contrast; blue at night), the *fog*, and a *bloom* around its lamps (see
+[FORMATS.md](FORMATS.md#screen-look-tint-glow-geometry-and-bloom)). The
+script rebuilds them in the compositor (*HG Screen*), keyed per shot, in
+the game's order: tint, fog, the lamps put back on top (they are drawn
+after both in the game), and the bloom from the lamps. The game works on
+display values, so the compositor converts the render to sRGB first and
+back at the end.
+
+* Fog: beyond the fog's start distance a colour is laid over the picture,
+  changing from the near to the far colour with the distance (from the depth
+  pass), as the game's palette ramp does. Some shots keep the characters
+  clear of it; a shader output (`hg_character`) marks them.
+* The lamps are the rooms' `_glow` objects (and `g_chandelie`); a shader
+  output (`hg_glow`) marks them.
+* `--look` chooses how the tint and the bloom are made:
+  * `hybrid` (default): the game's formulas, strengths and order, with
+    smooth Gaussian blurs sized to the render resolution;
+  * `emulate`: also the game's half-size buffers, point sampling and 8-tap
+    blurs, so the glow is as blocky as the original's;
+  * `modern`: the tint as in `hybrid` (it is a colour grade with local
+    contrast, which needs the game's curve, see section 5), and the lamps as
+    HDR emission put back after the tint and the fog, with a smooth bloom
+    over a threshold in linear light and a soft highlight shoulder that keeps
+    their colour;
+  * `none`: fog only.
+  The blur sizes follow `--resolution` at the time the script runs; run it
+  again after changing the render size.
+* `--time-of-day` chooses the tint the rooms show: `story` (default) as the
+  cutscene plays in the story (warm only for the opening EV0002 and
+  EV0003), `gallery` as the game's movie gallery shows it (warm in most of
+  the first area's rooms), `warm`, or `night` (the rooms' own values).
+
+These effects only show in renders and in the viewport's compositor preview.
 
 **The movie layer.** The movie is put on a plane just in front of the
 camera that fills the frame. If it holds full-screen pre-rendered shots, the
@@ -273,7 +369,7 @@ still empty; an action without a slot animates nothing.
    **Action** `EV0014`, **Slot** `A01_FIN_000_blendshapes`.
 
 The tiny mesh `A01_FIN_000_blendshapes` only exists to carry these curves:
-it has the same shape-key names as the body (`face_01`…`face_15`,
+it has the same shape-key names as the body (`face_01_mouth`…`face_15_expression`,
 `hand_l_01`…, `hand_r_01`…). Characters without shape keys (e.g.
 `DNT_000`) have no carrier; skip this step for them.
 
@@ -356,7 +452,11 @@ Every empty under the room stand-in (such as `ST_011_obj000_spoon`) carries
 the movement of the room object with the same name. Select the room's object
 (`ST_011_obj000_spoon.001` if the name clashed) and in *Object > Animation*
 set **Action** `EV0014`, **Slot** `ST_011_obj000_spoon`. Then hide the empty.
-Outside the shots that move it, the object stays where the room file puts it.
+Outside the shots that move it, the object stays where the room file puts it;
+like in the game, objects the cutscene animates are hidden (scaled to 0) in
+the shots that do not use them. Doors that a cutscene swings (`ST_011_door0`)
+work the same way: give the door's slot to the room's door object (after
+clearing its gameplay action, step 7).
 
 Empties named `prop_…` directly under the cutscene root are props without a
 room object (spots the game used to place effects or attached items). They
@@ -405,7 +505,7 @@ blender --python tools/blender_markers.py -- export/cutscenes/EV0014/EV0014.glb 
 | Wrong textures after using the glTF Variants panel | The variant list belongs to one import; swap materials by hand (step 5) |
 | Earrings, chokers or Daniella's shard appear where the game shows none | Hide the objects listed in `hidden_parts` (step 5) |
 | A shot shows the room or an empty view where the game shows a pre-rendered film | The movie layer is missing (section 2, *The movie layer*) |
-| Colours darker and greyer than in the game | The view transform is AgX; use *Standard* (*Render Properties > Color Management*) |
+| Colours darker and greyer than in the game | The view transform is AgX; use *Raw* for the script's display-value scene (*Standard* with `--render-space linear`) (*Render Properties > Color Management*) |
 | Two moons, stray glass shards or props the game does not show | Room objects named `…_selNNN` (custom property `visibility_selector`) are switched on and off by the game's event scripts, which are not decoded, so all are shown. Hide the ones the shot does not need (EV0018: `ST_060_main_sel023` is the second moon, `ST_060_effects_sel021` the glass debris before the dome breaks) |
 | Two rooms on top of each other | The rooms are not parented to their stand-ins (step 7) |
 | Doors swing or curtains move on their own | Clear the room's gameplay actions (step 7) |
@@ -422,3 +522,31 @@ Engines that bind animation to an object's *path* in the hierarchy (Unity's
 Animator, for example) need the clip's paths changed from the stand-in
 (`A01_FIN_000/...`) to the character's own hierarchy; there, the
 self-contained export (`--embed-models`) is the simpler choice.
+
+**The screen look in an engine.** The room file's `room_effects` extras hold
+the game's values (colours and alphas on 0–255), the warm variant in
+`script_variants` for the cutscenes whose `story_state` calls for it, and
+`engine_look`, the same look prepared for engines, per variant (`night` is
+the rooms' own values):
+
+| Game effect | Engine setting | `engine_look` values |
+|---|---|---|
+| Tint | a colour grade on display values with local contrast (a custom post effect, or a LUT, see below) | `grade`: the response curve F per channel at 33 even steps of display value; `detail_gain`; `tint_sigma` |
+| Lamps (`<room>_glow`) | export the rooms with `--emissive-glow` (emissive materials, strength `lamp_emission`, 4) | — |
+| Bloom (`bloom`) | Bloom over a threshold (only the lamps exceed it) | `lamp_bloom_threshold` 1, `lamp_bloom_tint`, `lamp_bloom_intensity`, a chain of Gaussian levels `lamp_bloom_levels` from `lamp_bloom_sigma` (`lamp_bloom_radius` is its half-energy radius) |
+| Fog (`fog`) | Distance fog from the near to the far colour, alpha / 256 | start and end in game units (0.1 m); the game's ramp is linear in 1 / distance |
+
+Sizes are fractions of the picture width. The tint is exactly
+
+    display' = F(B) + detail_gain × (display − B),   B = gaussian(display, tint_sigma)
+
+per channel, in display values (0–1) after tone mapping: flat areas follow
+the curve, detail finer than the blur is scaled by `detail_gain`. It cannot
+be made from a gain, a bloom and a sharpen in linear light: the game's glow
+buffers clip (in some rooms the darkening stops above display value 0.16)
+and the sRGB curve makes a display gain tone-dependent. Tried on four
+cutscenes, the best such decomposition was within 2 levels of the game in
+warm and night rooms but 15–24 levels off (brown, the chandeliers' blue
+gone) in room 0x0C's hall, and lost 5–25 % of the local contrast. Applying
+`grade` as an ordinary colour-grading LUT gives F(display) instead: flat
+areas exact, detail with the curve's slope instead of `detail_gain`.

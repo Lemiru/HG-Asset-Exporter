@@ -30,7 +30,7 @@ def family_banks(pck: Path) -> list[tuple[str, Path]]:
     return out
 
 
-def _job_character(pck: str, out: str, scale: float, fmt: str) -> dict:
+def _job_character(pck: str, out: str, scale: float, fmt: str, specular: bool = False) -> dict:
     from .character import CharacterOptions, export_animation_variant, export_character, same_rig, variant_base
     p = Path(pck)
     model = parse_pck(p)
@@ -50,8 +50,13 @@ def _job_character(pck: str, out: str, scale: float, fmt: str) -> dict:
             skipped.append(f"{path.name}: targets bone slot {max(targets)} beyond palette {len(model.palette)}")
             continue
         banks.append((label, bank))
-    rep = export_character(p, Path(out), CharacterOptions(scale=scale, extra_banks=banks))
+    rep = export_character(p, Path(out), CharacterOptions(scale=scale, extra_banks=banks, specular=specular))
     rep["mtn_banks"] = [label for label, _b in banks]
+    # the game's per-part shine as grey masks next to the textures (export/shine.py)
+    from .shine import export_shine_masks
+    masks = export_shine_masks(p, Path(out).parents[2] / "textures" / p.parent.name)
+    if masks:
+        rep["shine_masks"] = masks
     from .character import export_shadow_volumes
     shadow = Path(out).with_name(Path(out).stem + "_shadow" + Path(out).suffix)
     rep["shadow_file"] = export_shadow_volumes(p, shadow, CharacterOptions(scale=scale)).get("shadow_volumes", 0)
@@ -60,11 +65,12 @@ def _job_character(pck: str, out: str, scale: float, fmt: str) -> dict:
     return rep
 
 
-def _job_stage(pac: str, out: str, scale: float, fmt: str) -> dict:
+def _job_stage(pac: str, out: str, scale: float, fmt: str, emissive_glow: float = 0.0) -> dict:
     from .stage import StageOptions, export_stage
     from .stage import export_navmesh, export_zones
     door = Path(pac).parent.parent / "O_FIN" / "FIN_D000.MTN"
-    rep = export_stage(pac, out, StageOptions(scale=scale, door_motion=door if door.is_file() else None))
+    rep = export_stage(pac, out, StageOptions(scale=scale, door_motion=door if door.is_file() else None,
+                                              emissive_glow=emissive_glow))
     nav = Path(out).with_name(Path(out).stem + "_navmesh" + Path(out).suffix)
     rep["navmesh"] = export_navmesh(pac, nav, scale)
     rep["zones"] = export_zones(pac, Path(out).with_name(Path(out).stem + "_zones" + Path(out).suffix), scale)
@@ -142,7 +148,8 @@ def _job_movie(sfd: str, out_dir: str) -> dict:
 
 
 def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, only: str | None,
-         embed_cutscene_models: bool = False) -> list[tuple]:
+         embed_cutscene_models: bool = False, specular: bool = False,
+         emissive_glow: float = 0.0) -> list[tuple]:
     ext = "." + fmt
     jobs: list[tuple] = []
 
@@ -156,12 +163,14 @@ def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, on
                 label = variant_label(pck)
                 stem = f"{pck.stem}_{label}" if label else pck.stem
                 jobs.append(("characters", pck, _job_character,
-                             (str(pck), str(out / "characters" / pck.parent.name / (stem + ext)), scale, fmt)))
+                             (str(pck), str(out / "characters" / pck.parent.name / (stem + ext)), scale, fmt,
+                              specular)))
     if "stages" in categories:
         for pac in sorted(data.glob("ST_*/*.PAC")):
             if want(pac):
                 jobs.append(("stages", pac, _job_stage,
-                             (str(pac), str(out / "stages" / pac.parent.name / (pac.stem + ext)), scale, fmt)))
+                             (str(pac), str(out / "stages" / pac.parent.name / (pac.stem + ext)), scale, fmt,
+                              emissive_glow)))
     if "cutscenes" in categories:
         for dh in sorted(data.glob("*/*.DH")):
             ev = dh.parent
@@ -228,10 +237,10 @@ def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, on
 
 def run(data: Path, out: Path, categories: set[str] | None = None, *, scale: float = 0.1, fmt: str = "glb",
         workers: int | None = None, only: str | None = None, embed_cutscene_models: bool = False,
-        log=print) -> dict:
+        specular: bool = False, emissive_glow: float = 0.0, log=print) -> dict:
     categories = set(categories or CATEGORIES)
     out.mkdir(parents=True, exist_ok=True)
-    jobs = plan(data, out, categories, scale, fmt, only, embed_cutscene_models)
+    jobs = plan(data, out, categories, scale, fmt, only, embed_cutscene_models, specular, emissive_glow)
     log(f"{len(jobs)} export jobs")
     results: dict[str, list] = {c: [] for c in categories}
     failures = 0

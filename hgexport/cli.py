@@ -18,7 +18,8 @@ def cmd_all(a) -> int:
     from .export.batch import CATEGORIES, run
     cats = set(a.only_category or CATEGORIES)
     manifest = run(Path(a.data), Path(a.out), cats, scale=a.scale, fmt=a.format, workers=a.workers, only=a.filter,
-                   embed_cutscene_models=a.embed_cutscene_models)
+                   embed_cutscene_models=a.embed_cutscene_models, specular=a.specular,
+                   emissive_glow=a.emissive_glow or 0.0)
     print(json.dumps(manifest["counts"]), "failures:", manifest["failures"])
     return 1 if manifest["failures"] else 0
 
@@ -33,7 +34,7 @@ def cmd_character(a) -> int:
         banks.append((m.stem.upper(), parse_motion_bank(m.read_bytes(), name=m.name)))
     opts = CharacterOptions(scale=a.scale, animations=not a.no_animations, mesh=not a.animations_only,
                             morphs=not a.no_morphs, game_alpha=a.game_alpha, bleed=a.bleed,
-                            texture_variant=a.textures, unlit=a.unlit, extra_banks=banks,
+                            specular=a.specular, texture_variant=a.textures, unlit=a.unlit, extra_banks=banks,
                             root_motion=a.root_motion, separate_parts=a.separate_parts,
                             shadow_volumes=a.shadow_volumes, feet=not a.no_foot_contacts,
                             hand_poses=not a.no_hand_poses)
@@ -52,7 +53,7 @@ def cmd_stage(a) -> int:
                        StageOptions(scale=a.scale, vertex_colors=not a.no_vertex_colors, doors=not a.no_doors,
                                     objects=not a.no_objects, unlit=not a.lit,
                                     animations=not a.no_animations, lights=not a.no_lights,
-                                    game_alpha=a.game_alpha, bleed=a.bleed,
+                                    game_alpha=a.game_alpha, bleed=a.bleed, emissive_glow=a.emissive_glow or 0.0,
                                     door_motion=Path(a.door_motion) if a.door_motion else _default_door(a.pac),
                                     extra_door_motion=_extra_doors(a)))
     print(json.dumps(rep, indent=1))
@@ -198,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
                                                                 "audio", "music", "text", "movies", "misc"))
     p.add_argument("--filter", help="only sources whose path contains this text")
     p.add_argument("--workers", type=int)
+    p.add_argument("--specular", action="store_true",
+                   help="characters: the game's per-part shine as specular in the materials (the masks are always "
+                        "written to textures/<folder>/<model>_mNN_shine.png)")
+    p.add_argument("--emissive-glow", type=float, nargs="?", const=4.0, metavar="STRENGTH",
+                   help="rooms: make the glow geometry (lamps, candles; drawn into the game's bloom) emissive at this strength, default 4, for engines whose bloom works from emission (KHR_materials_emissive_strength; off by default)")
     p.add_argument("--embed-cutscene-models", action="store_true",
                    help="cutscene files include actor meshes and room geometry (default: animation, camera "
                         "and props only, referencing the character/stage exports by name)")
@@ -220,6 +226,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="keep the game's alpha-blend flag as BLEND materials (default: one alpha mode per mesh element "
                         "from the texels it uses)")
     p.add_argument("--unlit", action="store_true")
+    p.add_argument("--specular", action="store_true",
+                   help="the game's per-part shine as specular in the materials (KHR_materials_specular; off by "
+                        "default: the game computes it but never shows it in normal play)")
     p.add_argument("--bleed", action="store_true", help="fill the colour under fully transparent texels from their visible neighbours (removes the dark "
                         "fringes the sheets store there; the game shows them)")
     p.add_argument("--shadow-volumes", action="store_true",
@@ -244,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lit", action="store_true", help="lit materials instead of unlit (lighting is baked)")
     p.add_argument("--no-animations", action="store_true", help="no atlas/door/fan/shape clips")
     p.add_argument("--no-lights", action="store_true", help="leave out the room's character lights (slot 4)")
+    p.add_argument("--emissive-glow", type=float, nargs="?", const=4.0, metavar="STRENGTH",
+                   help="rooms: make the glow geometry (lamps, candles; drawn into the game's bloom) emissive at this strength, default 4, for engines whose bloom works from emission (KHR_materials_emissive_strength; off by default)")
     p.add_argument("--bleed", action="store_true", help="fill the colour under fully transparent texels from their visible neighbours (removes the dark "
                         "fringes the sheets store there; the game shows them)")
     p.add_argument("--game-alpha", action="store_true",

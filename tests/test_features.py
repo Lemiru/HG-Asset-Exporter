@@ -148,6 +148,26 @@ class ModelAndSceneTests(unittest.TestCase):
         self.assertEqual([r["sample"] for r in used], [0, 1, 2, 3])
         self.assertEqual(used[0]["voice"], 36)
 
+    def test_cutscene_doors_and_prop_groups(self):
+        """DP section 32 turns room door 0 (DH door mask bit 0); prop-group
+        objects are shown only in the cuts that animate their group."""
+        from hgexport.export.cutscene import export_event
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "ev.glb"
+            rep = export_event(DATA / "EV0014", out)
+            self.assertEqual(rep["doors_animated"], ["ST_011_door0"])
+            self.assertEqual(rep["props_shown_per_cut"], ["spoon"])
+            doc = Gltf(out).json
+            nodes = doc["nodes"]
+            paths = {(nodes[c["target"]["node"]]["name"], c["target"]["path"])
+                     for c in doc["animations"][0]["channels"] if "node" in c["target"]}
+            self.assertIn(("ST_011_door0", "rotation"), paths)
+            self.assertIn(("ST_011_obj000_spoon", "scale"), paths)
+            self.assertNotIn("prop_doornull0", {n.get("name") for n in nodes})
+            story = next(n["extras"]["story_state"] for n in nodes if "story_state" in n.get("extras", {}))
+            self.assertEqual(story["story_flags"], [1, 2])          # after the opening: the rooms' night look
+            self.assertEqual(validate(out), [])
+
     def test_shadow_volumes(self):
         from hgexport.export.character import export_shadow_volumes
         from hgexport.formats.shadow import parse_shadow_volumes, pck_bytes
@@ -371,6 +391,64 @@ class ModelAndSceneTests(unittest.TestCase):
         self.assertEqual(cutscene_hidden_parts("DNL_000", "EV0002"), ("Glass Shard",))
         self.assertIn("Jade Choker", cutscene_hidden_parts("FIN_000", "EV0002"))
         self.assertEqual(cutscene_hidden_parts("HEW_000", "EV0002"), ())
+
+    def test_room_look_and_glow_geometry(self):
+        from hgexport.export.look import cutscene_story_state, room_look, room_variants, tint_grade
+        from hgexport.export.stage import StageOptions, export_stage
+        from hgexport.formats.roomdata import parse_room_effects
+        from hgexport.formats.stage import parse_pac
+        fx = parse_room_effects(parse_pac(DATA / "ST_020" / "ST_021.PAC"))
+        self.assertEqual(fx["tint"]["colors"], [[138, 156, 196, 106], [88, 82, 78, 58]])
+        self.assertEqual(fx["bloom"]["color"], [118, 86, 62, 74])
+        variants = room_variants("ST_021")
+        warm = [[132, 96, 60, 80], [36, 42, 42, 70]]
+        self.assertEqual(room_look(fx, variants, cutscene_story_state("EV0002"))["tint"]["colors"], warm)
+        self.assertEqual(room_look(fx, variants, cutscene_story_state("EV0007"))["tint"], fx["tint"])
+        self.assertEqual(room_look(fx, variants, None)["tint"], fx["tint"])
+        # room 0x0C: the second pass's glow buffer clips, so a flat 0.23 rises to 0.426 in red
+        hall = {"colors": [[102, 116, 160, 116], [74, 86, 96, 138]]}
+        self.assertAlmostEqual(tint_grade(hall, 0.23)[0], 0.4258, places=3)
+        self.assertEqual(tint_grade(None, 0.5), [0.5, 0.5, 0.5])
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "st.glb"
+            export_stage(DATA / "ST_020" / "ST_021.PAC", out, StageOptions(emissive_glow=4.0))
+            g = Gltf(out).json
+            root = g["nodes"][g["scenes"][0]["nodes"][0]]
+            self.assertEqual(root["extras"]["room_effects"]["script_variants"][0]["when"], {"story_flag_clear": 1})
+            engine = root["extras"]["room_effects"]["engine_look"]
+            self.assertEqual(sorted(engine), ["night", "warm"])
+            self.assertEqual(len(engine["night"]["grade"]), 33)
+            self.assertEqual(engine["night"]["grade"][0], [0.0, 0.0, 0.0])
+            self.assertEqual(engine["night"]["detail_gain"], round(1 + 58 / 256, 4))
+            self.assertGreater(engine["night"]["lamp_bloom_intensity"], 0)
+            glow = next(n for n in g["nodes"] if n.get("name") == "ST_021_glow")
+            mats = [g["materials"][p["material"]] for p in g["meshes"][glow["mesh"]]["primitives"]]
+            self.assertTrue(mats and all(m["name"].endswith("_glow") and m["extras"]["glow"] for m in mats))
+            self.assertTrue(all("KHR_materials_emissive_strength" in m["extensions"] for m in mats))
+            self.assertEqual(validate(out), [])
+
+    def test_shine_masks_and_specular(self):
+        from hgexport.export.character import CharacterOptions, export_character
+        from hgexport.export.shine import export_shine_masks
+        src = DATA / "O_FIN" / "FIN_000.PCK"
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(export_shine_masks(src, tmp), ["FIN_000_m00_shine.png", "FIN_000_m01_shine.png"])
+            self.assertEqual(export_shine_masks(DATA / "O_HEW" / "HEW_000.PCK", tmp), [])
+            plain, spec = Path(tmp) / "a.glb", Path(tmp) / "b.glb"
+            export_character(src, plain, CharacterOptions(animations=False))
+            export_character(src, spec, CharacterOptions(animations=False, specular=True))
+            self.assertNotIn("KHR_materials_specular", Gltf(plain).json.get("extensionsUsed", []))
+            g = Gltf(spec).json
+            self.assertIn("KHR_materials_specular", g["extensionsUsed"])
+            mats = {m["name"]: m for m in g["materials"]}
+            shiny = mats["FIN_000_m00_opaque"]
+            ext = shiny["extensions"]["KHR_materials_specular"]
+            self.assertIn("specularTexture", ext)
+            self.assertEqual(ext["specularColorTexture"], shiny["pbrMetallicRoughness"]["baseColorTexture"])
+            self.assertIn("metallicRoughnessTexture", shiny["pbrMetallicRoughness"])
+            self.assertAlmostEqual(shiny["extensions"]["KHR_materials_ior"]["ior"], 2.784, places=3)   # strength 64
+            self.assertEqual(mats["FIN_000_m02_opaque"]["extensions"]["KHR_materials_specular"], {"specularFactor": 0.0})
+            self.assertEqual(validate(spec), [])
 
 
 if __name__ == "__main__":

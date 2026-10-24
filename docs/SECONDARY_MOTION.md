@@ -278,7 +278,13 @@ into keyframes; it runs live, like any Blender simulation:
   objects follow the body: `…_physics_frames` (each simulated bone's animated
   position before write-back) and `…_colliders` (the collision shapes).
 * **Steps.** A simulation zone runs the node types above, once per frame in
-  the game's node order.
+  the game's node order. Nodes are stepped in a few passes ("levels")
+  rather than one by one: a node waits for its anchor and for a partner the
+  game updates before it, and is not stepped after a partner the game
+  updates after it, so every node reads exactly what it reads in the game.
+  The results are bit-for-bit those of the one-by-one order, about 2.5
+  times faster (EV0004: 9 ms per frame for three characters instead of
+  23 ms).
 * **Write-back.** In the assembled scene only, the simulated bones' rest
   orientation is turned to match the game's (Blender's Y axis along the
   game's X axis, Z along the game's Y axis; the mesh does not move). Three

@@ -56,7 +56,7 @@ if cut_arm.animation_data.action_slot if hasattr(cut_arm.animation_data, "action
     char_arm.animation_data.action_slot = cut_arm.animation_data.action_slot
 carrier = next((o for o in cut_objs if o.type == "MESH" and o.name.startswith(actor) and o.data.shape_keys), None)
 body = next((o for o in char_objs if o.type == "MESH" and o.data.shape_keys
-             and o.data.shape_keys.key_blocks.get("face_01")), None)
+             and any(k.name.startswith("face_01") for k in o.data.shape_keys.key_blocks)), None)
 if carrier and body and carrier.data.shape_keys.animation_data:
     sk = body.data.shape_keys
     sk.animation_data_create()
@@ -83,7 +83,7 @@ for f in frames:
                    hand.name: [round(c, 3) for c in char_arm.matrix_world @ hand.head]})
     if carrier and body:
         emb_mesh = next((o for o in emb_objs if o.type == "MESH" and o.data.shape_keys
-                         and o.data.shape_keys.key_blocks.get("face_01")
+                         and any(k.name.startswith("face_01") for k in o.data.shape_keys.key_blocks)
                          and any(p.name.startswith(actor) for p in chain(o))), None)
         if emb_mesh:
             diff = max(abs(k.value - emb_mesh.data.shape_keys.key_blocks[k.name].value)

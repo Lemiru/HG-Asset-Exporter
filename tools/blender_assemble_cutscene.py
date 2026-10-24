@@ -20,6 +20,24 @@ Options after ``--``:
     --no-sound          do not add the event's soundtrack (EVxxxx.wav) to the sequencer
     --no-cut-lighting   keep the rooms' lights as imported instead of applying the
                         cutscene's per-cut character lighting (PARAMS.BIN)
+    --no-fog            leave out the game's fog (room fog and the cutscene's per-cut
+                        fog, applied in the compositor)
+    --look MODE         the rooms' screen look (tint, lamps and their bloom), in the
+                        compositor: hybrid (default: the game's formulas with smooth
+                        blurs), emulate (the game's half-size buffers and 8-tap blurs,
+                        blocky like the original), modern (the tint as in hybrid, the
+                        lamps as HDR emission with a scene-linear threshold bloom and
+                        a highlight shoulder),
+                        none. Blur sizes follow --resolution; re-run the script after
+                        changing the resolution
+    --character-shading game (default) shades the characters like the game: texture x
+                        (ambient + lights) in display values, lights in the game's units
+                        (EEVEE only: uses Shader to RGB); physical keeps glTF's lit
+                        materials with the export's light scale (for Cycles)
+    --time-of-day T     which tint the rooms use: story (default: as the cutscene plays
+                        in the story; warm only for the opening EV0002 / EV0003),
+                        gallery (as the movie gallery shows it: warm in most early
+                        rooms), warm, night (the rooms' own values)
     --shadows           keep the lights' shadows (the game casts none from its lights;
                         with them, hair and low-poly edges throw hard shadows on faces)
     --blended           keep the importer's BLENDED render method for the characters'
@@ -35,11 +53,24 @@ Options after ``--``:
     --bake-physics      bake the simulations over the whole cutscene and pack them into the
                         .blend, so jumping to any frame shows what playing from the start
                         gives (free the bake in the HG Physics modifier to go back to live)
+    --no-letterbox      leave out the cutscene letterbox (black bars over the top and
+                        bottom eighth of the frame, drawn by the game in every event)
+    --end-fade          add the movie gallery's fade to black over an event's last 14
+                        frames (whether story playback fades too is unverified)
+    --start-fade        add the movie gallery's fade in from black over an event's first
+                        17 frames
     --no-movie          leave out the event movie. By default it is placed on a plane in
                         front of the camera: full-screen pre-rendered inserts replace the
                         view during their cuts, effect movies are added over the view
-    --view-transform T  colour management view transform (default Standard: the game's
-                        colours unchanged; Blender's own default AgX darkens them)
+    --render-space S    display (default): render in display values like the PS2 - raw
+                        textures, vertex colours interpolated and multiplied in display
+                        values, translucent layers blended in them, GS rounding - shown
+                        with the Raw view transform; linear: Blender's scene-linear
+                        materials (dark gradients and fading layers come out brighter);
+                        --character-shading physical always uses linear
+    --view-transform T  colour management view transform (default Raw with the display
+                        render space, else Standard: the game's colours unchanged;
+                        Blender's own default AgX darkens them)
 
 From Blender's Text Editor: set CUTSCENE below and press Run Script (adds
 the cutscene to the open file and sets its frame rate to 30 fps).
@@ -169,6 +200,7 @@ def read_gltf_json(path: Path) -> dict:
 
 LUX_PER_UNIT = 2000.0 / 128.0      # the exporter's light scale: game colour 128 = 2000 lux
 WATTS_PER_LUX = 1.0 / 683.0        # Blender sun strength (W/m^2) per lux
+MATCH_DISTANCE = 2.5               # metres: where point lights match the game's linear falloff (as the export)
 
 
 def constant_keys(id_data, path: str, index: int = -1) -> None:
@@ -178,12 +210,223 @@ def constant_keys(id_data, path: str, index: int = -1) -> None:
                 kp.interpolation = "CONSTANT"
 
 
-def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Path, report: list) -> None:
+# Render space (--render-space): "display" renders the scene in display values
+# as the GS does (textures read raw, vertex colours turned back into display
+# values, translucent layers blended in display values; shown with the Raw view
+# transform); "linear" keeps Blender's scene-linear materials.
+DISPLAY_SPACE = True
+
+
+def _srgb_nodes(N, L):
+    """math / encode / decode builders for a shader node tree."""
+    def math(op, a, b=None, clamp=False):
+        n = N.new("ShaderNodeMath")
+        n.operation, n.use_clamp = op, clamp
+        for i, v in enumerate((a, b)):
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            else:
+                L.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    def pick(cond, if_true, if_false):
+        n = N.new("ShaderNodeMix")
+        n.data_type = "FLOAT"
+        L.new(cond, n.inputs[0])
+        L.new(if_false, n.inputs[2])
+        L.new(if_true, n.inputs[3])
+        return n.outputs[0]
+
+    def encode(x):          # scene-linear -> sRGB display value
+        lin = math("MULTIPLY", x, 12.92)
+        curve = math("SUBTRACT", math("MULTIPLY", math("POWER", math("MAXIMUM", x, 0.0), 1.0 / 2.4), 1.055), 0.055)
+        return pick(math("LESS_THAN", x, 0.0031308), lin, curve)
+
+    def decode(y):
+        lin = math("DIVIDE", y, 12.92)
+        curve = math("POWER", math("DIVIDE", math("ADD", y, 0.055), 1.055), 2.4)
+        return pick(math("LESS_THAN", y, 0.04045), lin, curve)
+
+    return math, encode, decode
+
+
+def _game_shading_group():
+    """Shader group 'HG Game Shading': the game's character lighting. The
+    game sums the ambient and its lights into a vertex colour (128 = 1.0) and
+    the GS multiplies the texture's display value by it (checked in an
+    emulator: twice the ambient gives twice the screen value, ambient 128 the
+    texture itself). Light: the lights' diffuse sum in game units / 128 (from
+    Shader to RGB); the ambient is the group's own `ambient` colour (keyed per
+    cut). The texture's display value (read raw in the display render space,
+    else turned back from scene-linear) is multiplied and clamped; in the
+    linear render space the result is turned back into scene-linear."""
+    ng = bpy.data.node_groups.get("HG Game Shading")
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new("HG Game Shading", "ShaderNodeTree")
+    ng.interface.new_socket("Base Color", in_out="INPUT", socket_type="NodeSocketColor")
+    ng.interface.new_socket("Light", in_out="INPUT", socket_type="NodeSocketColor")
+    ng.interface.new_socket("Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+    N, L = ng.nodes, ng.links
+    gin, gout = N.new("NodeGroupInput"), N.new("NodeGroupOutput")
+    amb = N.new("ShaderNodeRGB")
+    amb.name = amb.label = "ambient"
+    amb.outputs[0].default_value = (0.0, 0.0, 0.0, 1.0)
+    math, encode, decode = _srgb_nodes(N, L)
+    base = N.new("ShaderNodeSeparateColor")
+    light = N.new("ShaderNodeSeparateColor")
+    ambient = N.new("ShaderNodeSeparateColor")
+    L.new(gin.outputs["Base Color"], base.inputs[0])
+    L.new(gin.outputs["Light"], light.inputs[0])
+    L.new(amb.outputs[0], ambient.inputs[0])
+    out = N.new("ShaderNodeCombineColor")
+    for c in range(3):
+        factor = math("ADD", light.outputs[c], ambient.outputs[c])
+        texel = base.outputs[c] if DISPLAY_SPACE else encode(base.outputs[c])
+        shown = math("MULTIPLY", texel, factor, clamp=True)
+        if DISPLAY_SPACE:              # the GS's integer modulate rounds down
+            shown = math("DIVIDE", math("FLOOR", math("ADD", math("MULTIPLY", shown, 255.0), 1e-3)), 255.0)
+        L.new(shown if DISPLAY_SPACE else decode(shown), out.inputs[c])
+    L.new(out.outputs[0], gout.inputs["Color"])
+    return ng
+
+
+def apply_display_space(scene, report: list) -> None:
+    """Render in display values, like the GS: textures are read raw (their
+    stored bytes are the game's display values) and the vertex colours are
+    stored as display values in float attributes, so the GS's Gouraud
+    interpolation (linear in display values) and modulate (texture x vertex
+    colour) come out as in the game, and EEVEE blends translucent layers in
+    display values as the game does (in scene-linear light a half-transparent
+    layer over black shows at 75 % instead of 50 %; dark pre-lit gradients
+    interpolated in linear light came out 5-15 % too bright). Alpha stays as
+    it is. The frame then holds display values: the compositor works on them
+    directly and the view transform is Raw."""
+    import numpy as np
+
+    def encode(x):
+        return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(np.maximum(x, 0.0), 1.0 / 2.4) - 0.055)
+
+    images, meshes = set(), set()
+    users = set()
+    for mat in bpy.data.materials:
+        nt = mat.node_tree
+        if nt is None:
+            continue
+        for n in nt.nodes:
+            if n.type == "TEX_IMAGE" and n.image is not None:
+                images.add(n.image)
+            elif n.type == "VERTEX_COLOR":
+                users.add(mat)
+    for o in scene.objects:
+        if o.type == "MESH" and any(s.material in users for s in o.material_slots):
+            meshes.add(o.data)
+    floored = 0
+    for mat in users:                  # texture x vertex colour: the GS's integer modulate rounds down
+        nt = mat.node_tree
+        for em in [n for n in nt.nodes if n.type == "EMISSION"]:
+            src = em.inputs["Color"].links[0].from_node if em.inputs["Color"].is_linked else None
+            if src is None or src.type != "MIX" or src.blend_type != "MULTIPLY":
+                continue
+            prod = em.inputs["Color"].links[0].from_socket
+            steps = []
+            for op, v in (("MULTIPLY", 255.0), ("ADD", 1e-3), ("FLOOR", None), ("MULTIPLY", 1.0 / 255.0)):
+                n = nt.nodes.new("ShaderNodeVectorMath")
+                n.operation = op
+                if v is not None:
+                    n.inputs[1].default_value = (v, v, v)
+                nt.links.new(prod, n.inputs[0])
+                prod = n.outputs[0]
+            nt.links.new(prod, em.inputs["Color"])
+            floored += 1
+    for me in meshes:
+        render_name = me.color_attributes[me.color_attributes.render_color_index].name             if me.color_attributes and me.color_attributes.render_color_index >= 0 else None
+        for attr in list(me.color_attributes):
+            name, domain = attr.name, attr.domain
+            buf = np.empty(len(attr.data) * 4, dtype=np.float32)
+            attr.data.foreach_get("color", buf)           # scene-linear for byte and float attributes
+            rgba = buf.reshape(-1, 4)
+            rgba[:, :3] = encode(rgba[:, :3])
+            me.color_attributes.remove(attr)
+            new = me.color_attributes.new(name, "FLOAT_COLOR", domain)
+            new.data.foreach_set("color", rgba.ravel())
+        if render_name:
+            me.color_attributes.render_color_index = me.color_attributes.find(render_name)
+            me.color_attributes.active_color_index = me.color_attributes.find(render_name)
+    for im in images:
+        if im.colorspace_settings.name != "Non-Color":
+            im.colorspace_settings.name = "Non-Color"
+    scene.render.dither_intensity = 0.0     # the frame holds exact 8-bit values, as the GS outputs
+    report.append(f"render space: display values ({len(images)} textures read raw, vertex colours of "
+                  f"{len(meshes)} meshes stored as display values, {floored} modulates rounded down like the GS, "
+                  "view transform Raw)")
+
+
+def apply_game_shading(actor_objs: list, report: list) -> None:
+    """Characters shaded like the game (see _game_shading_group): an emission
+    of texture x (ambient + lights) worked out in display values, the lights'
+    part from a white diffuse surface (Shader to RGB: EEVEE only). Keeps the
+    materials' alpha."""
+    group = _game_shading_group()
+    done = 0
+    for mat in {s.material for o in actor_objs if o.type == "MESH" for s in o.material_slots if s.material}:
+        nt = mat.node_tree
+        p = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None) if nt else None
+        out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None) if nt else None
+        if p is None or out is None:
+            continue
+        diffuse = nt.nodes.new("ShaderNodeBsdfDiffuse")
+        diffuse.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+        if p.inputs["Normal"].is_linked:
+            nt.links.new(p.inputs["Normal"].links[0].from_socket, diffuse.inputs["Normal"])
+        to_rgb = nt.nodes.new("ShaderNodeShaderToRGB")
+        nt.links.new(diffuse.outputs[0], to_rgb.inputs[0])
+        g = nt.nodes.new("ShaderNodeGroup")
+        g.node_tree = group
+        if p.inputs["Base Color"].is_linked:
+            nt.links.new(p.inputs["Base Color"].links[0].from_socket, g.inputs["Base Color"])
+        else:
+            g.inputs["Base Color"].default_value = p.inputs["Base Color"].default_value
+        nt.links.new(to_rgb.outputs[0], g.inputs["Light"])
+        emission = nt.nodes.new("ShaderNodeEmission")
+        nt.links.new(g.outputs[0], emission.inputs["Color"])
+        surface = emission.outputs[0]
+        alpha = p.inputs["Alpha"]
+        if alpha.is_linked or alpha.default_value < 1.0:
+            clear = nt.nodes.new("ShaderNodeBsdfTransparent")
+            mix = nt.nodes.new("ShaderNodeMixShader")
+            if alpha.is_linked:
+                nt.links.new(alpha.links[0].from_socket, mix.inputs[0])
+            else:
+                mix.inputs[0].default_value = alpha.default_value
+            nt.links.new(clear.outputs[0], mix.inputs[1])
+            nt.links.new(surface, mix.inputs[2])
+            surface = mix.outputs[0]
+        nt.links.new(surface, out.inputs["Surface"])
+        done += 1
+    report.append(f"character shading: game (texture x lighting in display values) on {done} materials")
+
+
+def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Path, report: list,
+                       game_units: bool = False) -> None:
     """The game lights characters per cut (PARAMS.BIN 'lighting' records):
     room lights x room_light_scale, ambient = room ambient + ambient_add, and
     up to two directional lights whose direction is the camera's view turned
-    by angles[0] about the camera's horizontal axis and angles[1] about up.
-    Rooms are unlit (pre-lit vertex colours), so this only changes actors."""
+    by angles[0] about the camera's horizontal axis (positive: down) and
+    angles[1] about up (positive: to the right).
+    Rooms are unlit (pre-lit vertex colours), so this only changes actors.
+
+    game_units (with apply_game_shading): lights in the game's units, so a
+    white diffuse surface facing a light of colour c gets c / 128 - suns of
+    strength pi c / 128 (W/m^2; Blender's diffuse is E / pi), point lights of
+    4 pi^2 d^2 c / 128 (1 - d / range) W, matching the game's linear falloff
+    at d = half the range (at most MATCH_DISTANCE; Blender's falls off with
+    the inverse square) - and the ambient keyed into the shading group, the
+    world black. Otherwise the export's photometric scale (128 = 2000 lux)
+    and a world colour for the ambient. Either way all the room's lights are
+    used (the game picks the three strongest per character)."""
     extras = next((n.get("extras", {}) for n in cut_json.get("nodes", [])
                    if "cut_parameters" in n.get("extras", {})), {})
     anim = (cut_json.get("animations") or [{}])[0].get("extras", {})
@@ -202,6 +445,19 @@ def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Pat
                     break
     room_lights = [o for o in scene.objects if o.type == "LIGHT" and o.parent is not None]
     base = {o.name: o.data.energy for o in room_lights}
+    if game_units:
+        for o in room_lights:
+            rgb = list(o.get("game_rgb", []))
+            if not rgb:
+                continue
+            lum = max(rgb) * max(float(o.get("game_intensity", 1.0)), 0.0)
+            o.data.color = [c / (max(rgb) or 1.0) for c in rgb]
+            if o.data.type == "POINT":
+                r = float(o.get("range_game_units", 0.0)) * UNIT
+                d = min(r / 2, MATCH_DISTANCE)
+                base[o.name] = 4 * math.pi ** 2 * d * d * lum / 128.0 * (1 - d / r) if r > 0 else 0.0
+            else:
+                base[o.name] = math.pi * lum / 128.0
     cut_lights = []
     for k in range(2):
         data = bpy.data.lights.new(f"cut_light{k}", "SUN")
@@ -221,21 +477,28 @@ def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Pat
             o.data.energy = base[o.name] * scale
             o.data.keyframe_insert("energy", frame=frame)
         add = rec["ambient_add"] if rec else [0, 0, 0]
-        # irradiance of a uniform world = pi * radiance; match LUX_PER_UNIT
-        amb = [(a + b) * LUX_PER_UNIT * WATTS_PER_LUX / math.pi for a, b in zip(ambient, add)]
-        if bg is not None:
-            bg.inputs[0].default_value = (*amb, 1.0)
-            bg.inputs[1].default_value = 1.0
-            bg.inputs[0].keyframe_insert("default_value", frame=frame)
+        if game_units:
+            shading = _game_shading_group().nodes["ambient"].outputs[0]
+            shading.default_value = (*[(a + b) / 128.0 for a, b in zip(ambient, add)], 1.0)
+            shading.keyframe_insert("default_value", frame=frame)
+            if bg is not None:
+                bg.inputs[0].default_value = (0.0, 0.0, 0.0, 1.0)
+        else:
+            # irradiance of a uniform world = pi * radiance; match LUX_PER_UNIT
+            amb = [(a + b) * LUX_PER_UNIT * WATTS_PER_LUX / math.pi for a, b in zip(ambient, add)]
+            if bg is not None:
+                bg.inputs[0].default_value = (*amb, 1.0)
+                bg.inputs[1].default_value = 1.0
+                bg.inputs[0].keyframe_insert("default_value", frame=frame)
         lights = rec["lights"] if rec else []
         for k, obj in enumerate(cut_lights):
             light = lights[k] if k < len(lights) else None
             color = light["color"] if light else [0, 0, 0]
             peak = max(color) or 1
             obj.data.color = [c / peak for c in color]
-            obj.data.energy = LUX_PER_UNIT * max(color) * WATTS_PER_LUX
+            obj.data.energy = (math.pi / 128.0 if game_units else LUX_PER_UNIT * WATTS_PER_LUX) * max(color)
             pitch, yaw = (light["angles"] if light else (0.0, 0.0))
-            obj.rotation_euler = (pitch, yaw, 0.0)
+            obj.rotation_euler = (-pitch, -yaw, 0.0)    # positive angles turn the view down / right
             obj.data.keyframe_insert("color", frame=frame)
             obj.data.keyframe_insert("energy", frame=frame)
             obj.keyframe_insert("rotation_euler", frame=frame)
@@ -245,10 +508,459 @@ def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Pat
         for path in ("color", "energy"):
             constant_keys(o.data, path)
         constant_keys(o, "rotation_euler")
-    if bg is not None:
+    if game_units:
+        constant_keys(_game_shading_group(), 'nodes["ambient"].outputs[0].default_value')
+    elif bg is not None:
         constant_keys(world.node_tree, 'nodes["Background"].inputs[0].default_value')
     report.append(f"cut lighting: {len(lighting)} of {len(cuts)} cuts, {len(room_lights)} room lights scaled, "
-                  f"2 camera lights, ambient {ambient}")
+                  f"2 camera lights, ambient {ambient}" + (" (game units)" if game_units else ""))
+
+
+def _room_of_cut(room_refs: list, frame: int):
+    """The room stand-in shown at `frame` (stand-ins are scaled to 0 in the
+    cuts of events that use several rooms)."""
+    for ref in room_refs:
+        ad = ref.animation_data
+        curves = [fc for fc in fcurves_of(ref) if fc.data_path == "scale"] if ad and ad.action else []
+        if not curves or curves[0].evaluate(frame + 0.1) > 0.5:
+            return ref
+    return room_refs[0] if room_refs else None
+
+
+LOOKS = ("hybrid", "emulate", "modern", "none")
+TIMES = ("story", "gallery", "warm", "night")
+# tap offsets of the game's half-size blur passes (export/look.py), in half-size pixels
+_TAPS1 = ((-1, -1), (1, -1), (-1, 1), (1, 1), (-2, 0), (2, 0), (0, -2), (0, 2))
+_TAPS2 = ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (2, -2), (-2, 2))
+
+
+def _story_state(cut_json: dict, time_of_day: str):
+    """The story state that picks the rooms' script variants: the cutscene's
+    own (story), none set (gallery: what the movie gallery shows), the warm
+    variants (warm) or the rooms' own values (night: None)."""
+    if time_of_day == "night":
+        return None
+    if time_of_day == "gallery":
+        return {"story_flags": [], "story_phase": 255}
+    if time_of_day == "warm":
+        return {"story_flags": [], "story_phase": 1}
+    return next((n["extras"]["story_state"] for n in cut_json.get("nodes", [])
+                 if "story_state" in n.get("extras", {})), None)
+
+
+def _room_look(effects: dict, state) -> dict:
+    """The tint and bloom a room shows in a story state (export/look.py)."""
+    look = {"tint": effects.get("tint"), "bloom": effects.get("bloom"), "variant": "night"}
+    if state is None:
+        return look
+    flags = set(state.get("story_flags", []))
+    for v in effects.get("script_variants", []):
+        when = v.get("when", {})
+        if "story_flag_clear" in when and when["story_flag_clear"] in flags:
+            continue
+        if "story_phase" in when and when["story_phase"] != state.get("story_phase"):
+            continue
+        look.update({k: v[k] for k in ("tint", "bloom") if k in v})
+        look["variant"] = v.get("name", "night")
+        break
+    return look
+
+
+def _add_aov(scene, name: str, materials) -> None:
+    vl = scene.view_layers[0]
+    if not any(a.name == name for a in vl.aovs):
+        aov = vl.aovs.add()
+        aov.name, aov.type = name, "VALUE"
+    for mat in materials:
+        if mat.node_tree and not any(n.type == "OUTPUT_AOV" and n.aov_name == name for n in mat.node_tree.nodes):
+            n = mat.node_tree.nodes.new("ShaderNodeOutputAOV")
+            n.aov_name = name
+            n.inputs["Value"].default_value = 1.0
+
+
+class _Comp:
+    """Compositor node helpers (colours as RGBA sockets)."""
+
+    def __init__(self, ng):
+        self.N, self.L = ng.nodes, ng.links
+
+    def node(self, kind, name=None, inputs=None, **props):
+        n = self.N.new(kind)
+        if name:
+            n.name = n.label = name
+        for k, v in props.items():
+            setattr(n, k, v)
+        for k, v in (inputs or {}).items():
+            n.inputs[k].default_value = v
+        return n
+
+    def put(self, socket, value):
+        if isinstance(value, (int, float, tuple)):
+            socket.default_value = value
+        else:
+            self.L.new(value, socket)
+
+    def math(self, op, a, b=None, clamp=False):
+        n = self.node("ShaderNodeMath", operation=op, use_clamp=clamp)
+        self.put(n.inputs[0], a)
+        if b is not None:
+            self.put(n.inputs[1], b)
+        return n.outputs[0]
+
+    def mix(self, blend, a, b, fac=1.0, clamp=True):
+        n = self.node("ShaderNodeMix", data_type="RGBA", blend_type=blend, clamp_result=clamp, clamp_factor=False)
+        self.put(n.inputs[0], fac)
+        self.put(n.inputs[6], a)
+        self.put(n.inputs[7], (b, b, b, 1.0) if isinstance(b, (int, float)) else b)
+        return n.outputs[2]
+
+    def add(self, a, b, fac=1.0, clamp=True):
+        return self.mix("ADD", a, b, fac, clamp)
+
+    def mul(self, a, b, clamp=True):
+        return self.mix("MULTIPLY", a, b, 1.0, clamp)
+
+    def sub(self, a, b):
+        return self.mix("SUBTRACT", a, b, 1.0, False)
+
+    def lerp(self, a, b, fac):
+        return self.mix("MIX", a, b, fac, False)
+
+    def convert(self, a, src, dst):
+        """Colour space conversion: the game works on display values, which the
+        Standard view transform makes from scene-linear with the sRGB curve."""
+        n = self.node("CompositorNodeConvertColorSpace", from_color_space=src, to_color_space=dst)
+        self.put(n.inputs[0], a)
+        return n.outputs[0]
+
+    def blur(self, a, sx, sy):
+        """Gaussian blur with standard deviations sx, sy in render pixels."""
+        n = self.node("CompositorNodeBlur", inputs={"Type": "Gaussian", "Size": (3.0 * sx, 3.0 * sy)})
+        self.put(n.inputs[0], a)
+        return n.outputs[0]
+
+    def shift(self, a, dx, dy):
+        n = self.node("CompositorNodeTranslate", inputs={"X": float(dx), "Y": float(dy), "Interpolation": "Nearest",
+                                                         "Extension X": "Extend", "Extension Y": "Extend"})
+        self.put(n.inputs[0], a)
+        return n.outputs[0]
+
+    def quantize(self, a):
+        """The GS's integer result: each channel rounded down to a 1/255 step."""
+        sep = self.node("CompositorNodeSeparateColor")
+        self.put(sep.inputs[0], a)
+        comb = self.node("CompositorNodeCombineColor")
+        for c in range(3):
+            step = self.math("ADD", self.math("MULTIPLY", sep.outputs[c], 255.0), 1e-3)     # k / 255 stays k
+            self.L.new(self.math("DIVIDE", self.math("FLOOR", step), 255.0), comb.inputs[c])
+        return comb.outputs[0]
+
+    def pixelate(self, a, size):
+        n = self.node("CompositorNodePixelate", inputs={"Size": int(size)})
+        self.put(n.inputs[0], a)
+        return n.outputs[0]
+
+
+
+def apply_screen_effects(scene, actor_objs: list, room_objs: list, cut_json: dict, room_refs: list, root: Path,
+                         report: list, fog: bool = True, look: str = "hybrid", time_of_day: str = "story",
+                         display: bool = False) -> None:
+    """The game's screen effects per cut, built in the compositor (see
+    hgexport/export/look.py and docs/BLENDER_CUTSCENES.md "Screen look"): the
+    room's tint, the fog, the glow geometry (lamps) put back over them, and
+    the bloom around the lamps. The game applies them in display values.
+
+    Fog: the drawer (func_002BB3E0) reads the depth buffer through a
+    256-colour palette (generator 2, Palette_Colour 0x1B8910): entry 0 the far
+    colour, entry 255 the near colour, the alpha halved, and the depth value
+    is linear in 1 / distance between the two distances (Camera_ZValue).
+    The near colour in front of the start distance (checked on DE000C 499,
+    where Fiona is 1 m from the camera and the fog starts at 1.1 m); the far
+    colour beyond the end and where nothing was drawn. A room's own fog is on from the start and covers
+    everything; a cutscene fog record replaces it from its cut on, and with a
+    non-zero `word` it is drawn before the characters, so they stay clear
+    (a shader AOV marks the characters: EEVEE has no object-index pass).
+
+    look: hybrid (default) = the game's formulas, gains and order with smooth
+    blurs sized to the render; emulate = also the game's half-size point
+    sampling and 8-tap blurs (resolution-bound and blocky, like the original);
+    modern = the tint and fog as in hybrid (the tint is a grade with local
+    contrast, see room_effects.engine_look), then the lamps as HDR emission
+    put back after them, bloomed over a threshold in scene-linear light with
+    a chain of Gaussian levels matched to the game's radius, and a
+    hue-preserving highlight shoulder; none = fog only.
+
+    display: the render holds display values (apply_display_space), and so
+    does the output (Raw view transform); else both are scene-linear."""
+    extras = next((n.get("extras", {}) for n in cut_json.get("nodes", [])
+                   if "cut_parameters" in n.get("extras", {})), {})
+    anim = (cut_json.get("animations") or [{}])[0].get("extras", {})
+    cuts = [c["start_frame"] for c in anim.get("cuts", [])]
+    records = {p["start_frame"]: p for p in extras.get("cut_parameters", []) if p.get("type") == "fog"}
+    if look not in LOOKS:
+        raise SystemExit(f"--look must be one of {', '.join(LOOKS)}")
+    if time_of_day not in TIMES:
+        raise SystemExit(f"--time-of-day must be one of {', '.join(TIMES)}")
+    state = _story_state(cut_json, time_of_day)
+    room_fx = {}
+    for ref in room_refs:
+        room_file = root / ref["room_file"]
+        if room_file.is_file():
+            for node in read_gltf_json(room_file).get("nodes", []):
+                fx = node.get("extras", {}).get("room_effects")
+                if fx:
+                    room_fx[ref.name] = fx
+                    break
+    if not cuts or (not fog and look == "none"):
+        return
+    states, fog_state, room = [], None, None
+    for frame in cuts:
+        ref = _room_of_cut(room_refs, frame)
+        if ref is not None and ref.name != room:
+            room = ref.name
+            f = room_fx.get(room, {}).get("fog")
+            fog_state = {**f, "word": 0} if f else None          # the room's fog ignores the word
+        fog_state = records.get(frame, fog_state)
+        lk = _room_look(room_fx.get(room, {}), state)
+        lk["engine"] = room_fx.get(room, {}).get("engine_look", {}).get(lk["variant"])
+        states.append((frame, fog_state, lk))
+
+    vl = scene.view_layers[0]
+    vl.use_pass_z = True
+    _add_aov(scene, "hg_character",
+             {s.material for o in actor_objs if o.type == "MESH" for s in o.material_slots if s.material})
+    glow_mats = {s.material for o in room_objs if o.type == "MESH" for s in o.material_slots
+                 if s.material and s.material.get("glow")}
+    _add_aov(scene, "hg_glow", glow_mats)
+    engine = next((lk["engine"] for _f, _s, lk in states if lk.get("engine")), None)
+    if look == "modern" and engine is None:
+        raise SystemExit("--look modern needs rooms exported with engine_look (re-export the stages)")
+    if look == "modern" and not display:
+        for mat in glow_mats:          # lamps brighter than the bloom's threshold
+            for n in mat.node_tree.nodes:
+                if n.type == "EMISSION":
+                    n.inputs["Strength"].default_value = engine["lamp_emission"]
+                elif n.type == "BSDF_PRINCIPLED":
+                    n.inputs["Emission Strength"].default_value = engine["lamp_emission"]
+
+    ng = bpy.data.node_groups.new("HG Screen", "CompositorNodeTree")
+    ng.interface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+    C = _Comp(ng)
+    keyed = []
+
+    def value(name, v=0.0):
+        n = C.node("ShaderNodeValue", name)
+        n.outputs[0].default_value = v
+        keyed.append(n)
+        return n.outputs[0]
+
+    def colour(name):
+        n = C.node("CompositorNodeRGB", name)
+        keyed.append(n)
+        return n.outputs[0]
+
+    rl = C.node("CompositorNodeRLayers")
+    rl.scene = scene
+    out = C.node("NodeGroupOutput")
+    w = scene.render.resolution_x * scene.render.resolution_percentage / 100.0
+    h = scene.render.resolution_y * scene.render.resolution_percentage / 100.0
+    hx, hy = w / 256.0, h / 224.0          # one pixel of the game's half-size buffers (256 x 224)
+    px = max(1, round(hx))
+
+    def glow_buffer(s):
+        """The tint's G: about 3 x a blur of the picture, clamped."""
+        if look == "emulate":
+            a = C.pixelate(s, px)
+            acc = a
+            for dx, dy in _TAPS1:
+                acc = C.add(acc, C.shift(a, dx * px, dy * px), 0.25)
+            return C.blur(acc, 0.45 * px, 0.45 * px)              # the bilinear enlargement
+        return C.mul(C.blur(s, 1.1 * hx, 1.1 * hy), 3.0)
+
+    def bloom_buffer(a_in):
+        if look == "emulate":
+            a = C.pixelate(a_in, px)
+            b = None
+            for dx, dy in _TAPS1:
+                t = C.shift(a, dx * px, dy * px)
+                b = C.mul(t, 0.5) if b is None else C.add(b, t, 0.5)
+            acc = a
+            for dx, dy in _TAPS2:
+                acc = C.add(acc, C.shift(b, dx * px, dy * px), 0.125)
+            return C.blur(acc, 0.45 * px, 0.45 * px)
+        b = C.mul(C.blur(a_in, hx, hy), 4.0)
+        return C.add(C.blur(a_in, 0.45 * hx, 0.45 * hy), C.blur(b, 2.06 * hx, 2.06 * hy))
+
+    image = rl.outputs["Image"]
+    s0 = image if display else C.convert(image, "Linear Rec.709", "sRGB")
+    s = C.mix("DARKEN", s0, 1.0, clamp=False) if look == "modern" else s0     # HDR lamps: drawn after the tint
+    exact = C.quantize if display else (lambda x: x)      # display values: the GS rounds each pass down
+    if look != "none":
+        c0, k0 = colour("tint_colour1"), value("tint_strength1")
+        s = exact(C.add(s, C.mul(glow_buffer(s), c0), k0))
+        c1, k1 = colour("tint_colour2"), value("tint_strength2")
+        s = exact(C.add(s, C.sub(s, C.mul(glow_buffer(s), c1)), k1))
+
+    if fog:
+        depth, char_mask = rl.outputs["Depth"], rl.outputs["hg_character"]
+        f0, f1 = colour("fog_near"), colour("fog_far")
+        a0, a1 = value("fog_near_alpha"), value("fog_far_alpha")
+        inv_start, inv_end = value("fog_inv_start"), value("fog_inv_end")
+        on, keep_chars = value("fog_on"), value("fog_skips_characters")
+        # position on the ramp: 0 at the start distance, 1 at the end, linear in 1 / depth
+        inv_depth = C.math("DIVIDE", 1.0, C.math("MAXIMUM", depth, 1e-4))
+        t_raw = C.math("DIVIDE", C.math("SUBTRACT", inv_start, inv_depth),
+                       C.math("MAXIMUM", C.math("SUBTRACT", inv_start, inv_end), 1e-9))
+        t = C.math("MINIMUM", C.math("MAXIMUM", t_raw, 0.0), 1.0)      # in front of the start: the near colour
+        fog_rgb = C.lerp(f0, f1, t)
+        alpha = C.node("ShaderNodeMix", data_type="FLOAT", clamp_factor=False)
+        C.put(alpha.inputs[0], t)
+        C.put(alpha.inputs[2], a0)
+        C.put(alpha.inputs[3], a1)
+        a = C.math("MULTIPLY", alpha.outputs[0], 1.0 / 256.0, clamp=True)    # the palette halves the alpha
+        a = C.math("MULTIPLY", a, C.math("SUBTRACT", 1.0, C.math("MULTIPLY", char_mask, keep_chars)))
+        a = C.math("MULTIPLY", a, on)
+        s = exact(C.lerp(s, fog_rgb, a))
+
+    if look in ("hybrid", "emulate"):
+        glow = rl.outputs["hg_glow"]
+        s = C.lerp(s, s0, glow)                  # the lamps are drawn after the tint and the fog
+        cb, kb = colour("bloom_colour"), value("bloom_strength")
+        lamps = C.mul(s, C.math("GREATER_THAN", glow, 0.01))
+        s = exact(C.add(s, C.mul(bloom_buffer(lamps), cb), kb))
+    result = s if display else C.convert(s, "sRGB", "Linear Rec.709")
+    if look == "modern":
+        # the lamps drawn after the tint and the fog, in HDR, and bloomed over a threshold
+        linear = C.convert(s, "sRGB", "Linear Rec.709")
+        hdr = image
+        if display:                    # the lamps' display colour as scene-linear emission
+            hdr = C.mul(C.convert(C.mix("DARKEN", image, 1.0, clamp=False), "sRGB", "Linear Rec.709"),
+                        engine["lamp_emission"], clamp=False)
+        linear = C.lerp(linear, hdr, rl.outputs["hg_glow"])
+        excess = C.mix("LIGHTEN", C.mix("SUBTRACT", linear, 1.0, engine["lamp_bloom_threshold"], clamp=False),
+                       0.0, 1.0, clamp=False)
+        spread = None
+        for weight, mult in engine["lamp_bloom_levels"]:
+            sigma = engine["lamp_bloom_sigma"] * mult * w
+            b = C.blur(excess, sigma, sigma)
+            spread = C.mul(b, weight, clamp=False) if spread is None else C.add(spread, b, weight, clamp=False)
+        linear = C.add(linear, C.mul(spread, colour("modern_lamp"), clamp=False), 1.0, clamp=False)
+        # a hue-preserving shoulder above 0.8: HDR lamps keep their colour on the Standard view
+        sep = C.node("CompositorNodeSeparateColor")
+        C.put(sep.inputs[0], linear)
+        peak = C.math("MAXIMUM", C.math("MAXIMUM", sep.outputs[0], sep.outputs[1]), sep.outputs[2])
+        over = C.math("MAXIMUM", C.math("SUBTRACT", peak, 0.8), 0.0)
+        soft = C.math("ADD", C.math("MINIMUM", peak, 0.8),
+                      C.math("MULTIPLY", 0.2, C.math("SUBTRACT", 1.0, C.math("EXPONENT", C.math("DIVIDE", over, -0.2)))))
+        linear = C.mul(linear, C.math("DIVIDE", soft, C.math("MAXIMUM", peak, 1e-6)), clamp=False)
+        result = C.convert(linear, "Linear Rec.709", "sRGB") if display else linear
+    C.L.new(result, out.inputs[0])
+    scene.compositing_node_group = ng
+
+    def set_value(name, v):
+        if name in ng.nodes:
+            ng.nodes[name].outputs[0].default_value = v
+
+    def set_colour(name, rgb):
+        if name in ng.nodes:
+            ng.nodes[name].outputs[0].default_value = (*rgb, 1.0)
+
+    for frame, fog_st, lk in states:
+        if fog:
+            if fog_st:
+                (r0, g0, b0, al0), (r1, g1, b1, al1) = fog_st["colors"]
+                set_colour("fog_near", (r0 / 255.0, g0 / 255.0, b0 / 255.0))
+                set_colour("fog_far", (r1 / 255.0, g1 / 255.0, b1 / 255.0))
+                set_value("fog_near_alpha", al0)
+                set_value("fog_far_alpha", al1)
+                set_value("fog_inv_start", 1.0 / max(fog_st["start"] * UNIT, 1e-3))
+                set_value("fog_inv_end", 1.0 / max(fog_st["end"] * UNIT, fog_st["start"] * UNIT + 1e-3))
+                set_value("fog_skips_characters", 1.0 if fog_st.get("word") else 0.0)
+            set_value("fog_on", 1.0 if fog_st else 0.0)
+        tint = (lk.get("tint") or {}).get("colors") or [[128, 128, 128, 0], [128, 128, 128, 0]]
+        bloom = (lk.get("bloom") or {}).get("color") or [128, 128, 128, 0]
+        (r0, g0, b0, al0), (r1, g1, b1, al1) = tint
+        k0, k1, kb = al0 / 256.0, al1 / 256.0, bloom[3] / 256.0      # the effects use alpha / 2 (0x80 = 1)
+        set_colour("tint_colour1", (r0 / 128.0, g0 / 128.0, b0 / 128.0))
+        set_value("tint_strength1", k0)
+        set_colour("tint_colour2", (r1 / 128.0, g1 / 128.0, b1 / 128.0))
+        set_value("tint_strength2", k1)
+        set_colour("bloom_colour", tuple(c / 128.0 for c in bloom[:3]))
+        set_value("bloom_strength", kb)
+        el = lk.get("engine")
+        if look == "modern" and el:
+            set_colour("modern_lamp", tuple(c * el["lamp_bloom_intensity"] for c in el["lamp_bloom_tint"]))
+        for n in keyed:
+            n.outputs[0].keyframe_insert("default_value", frame=frame)
+    for n in keyed:
+        constant_keys(ng, f'nodes["{n.name}"].outputs[0].default_value')
+    tinted = sum(1 for _f, _s, lk in states if (lk.get("tint") or {}).get("colors"))
+    report.append(f"screen: look {look}, time of day {time_of_day} "
+                  f"({'story state ' + json.dumps(state) if state else 'the rooms own values'}), tint in {tinted} "
+                  f"of {len(states)} cuts, {len(glow_mats)} glow materials"
+                  + (f"; fog: {len(records)} cut records, on in {sum(1 for _f, st, _l in states if st)} cuts"
+                     if fog else ""))
+
+
+LETTERBOX = 1.0 / 8.0               # each bar: 56 of the PS2's 448 lines (a 640 x 336 picture, 16:9)
+FADE_FRAMES = 16                    # the gallery's end fade: 1/16 darker per frame
+
+
+def apply_frame_overlays(scene, cut_json: dict, report: list, letterbox: bool = True, end_fade: bool = False,
+                         display: bool = False, start_fade: bool = False) -> None:
+    """What the game lays over the finished picture last: the cutscene
+    letterbox (black bars over the top and bottom eighth of the 4:3 frame,
+    in every event) and, optionally, the movie gallery's fade to black at
+    the end of an event (measured on DE000C and EV0019 while playing: from
+    14 frames before the end the picture is multiplied by (frames + 2 -
+    frame) / 16 in display values; the event ends at 3/16, and the gallery
+    cuts to black), and the fade in from black at its start (black up to
+    frame 1, then (frame - 1) / 16)."""
+    if not (letterbox or end_fade or start_fade):
+        return
+    ng = scene.compositing_node_group
+    if ng is None:                                  # no screen effects: start from the render
+        ng = bpy.data.node_groups.new("HG Screen", "CompositorNodeTree")
+        ng.interface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+        rl = ng.nodes.new("CompositorNodeRLayers")
+        rl.scene = scene
+        ng.nodes.new("NodeGroupOutput")
+        ng.links.new(rl.outputs["Image"], ng.nodes[-1].inputs[0])
+        scene.compositing_node_group = ng
+    C = _Comp(ng)
+    out = next(n for n in ng.nodes if n.type == "GROUP_OUTPUT")
+    image = out.inputs[0].links[0].from_socket
+    frames = next((n["extras"]["frames"] for n in cut_json.get("nodes", [])
+                   if "frames" in n.get("extras", {})), None)
+    keys = []
+    if start_fade:
+        keys += [(1, 0.0), (1 + FADE_FRAMES, 1.0)]
+        report.append(f"start fade: frames 1-{FADE_FRAMES}")
+    if end_fade and frames:
+        keys += [(frames + 2 - FADE_FRAMES, 1.0), (frames + 2, 0.0)]
+        report.append(f"end fade: frames {frames + 2 - FADE_FRAMES}-{frames - 1}")
+    if keys:
+        k = C.node("ShaderNodeValue", "gallery_fade")
+        for f, v in keys:
+            k.outputs[0].default_value = v
+            k.outputs[0].keyframe_insert("default_value", frame=f)
+        for fc in fcurves_of(ng):
+            if fc.data_path == 'nodes["gallery_fade"].outputs[0].default_value':
+                for kp in fc.keyframe_points:
+                    kp.interpolation = "LINEAR"
+        shown = image if display else C.convert(image, "Linear Rec.709", "sRGB")
+        shown = C.mul(shown, k.outputs[0], clamp=False)
+        image = shown if display else C.convert(shown, "sRGB", "Linear Rec.709")
+    if letterbox:
+        coords = C.node("CompositorNodeImageCoordinates")
+        C.put(coords.inputs[0], image)
+        xyz = C.node("ShaderNodeSeparateXYZ")
+        C.L.new(coords.outputs["Normalized"], xyz.inputs[0])
+        y = xyz.outputs["Y"]
+        inside = C.math("MULTIPLY", C.math("GREATER_THAN", y, LETTERBOX), C.math("LESS_THAN", y, 1.0 - LETTERBOX))
+        image = C.mul(image, inside, clamp=False)
+        report.append("letterbox: top and bottom eighth")
+    C.L.new(image, out.inputs[0])
 
 
 def is_blended(mat) -> bool:
@@ -922,7 +1634,10 @@ def _physics_node_group():
     geo = G.set_position(state, G.switch("VECTOR", restart, position, seed))
     geo = G.store(geo, "hg_v", G.switch("VECTOR", restart, G.attr("hg_v", "FLOAT_VECTOR"), G.xyz()), "FLOAT_VECTOR")
     geo = G.store(geo, "hg_aprev", G.switch("VECTOR", restart, G.attr("hg_aprev", "FLOAT_VECTOR"), O), "FLOAT_VECTOR")
-    orders = G.math("ADD", G.stat_max(geo, G.attr("hg_order", "INT")), 1.0)
+    # nodes are stepped level by level (hg_level, see _physics_levels): all
+    # nodes of a level read the state from before it, which gives exactly the
+    # game's one-by-one order with a few passes instead of one per node
+    orders = G.math("ADD", G.stat_max(geo, G.attr("hg_level", "INT")), 1.0)
     rs_in, rs_out = G.repeat(geo, G.switch("INT", game_reset, 0, orders), counter="Order")
     rcur = rs_in.outputs["Geometry"]
     mode = G.attr("hg_rs", "INT")
@@ -931,7 +1646,7 @@ def _physics_node_group():
                        G.sample(rcur, position, G.attr("hg_prev", "INT"), "FLOAT_VECTOR"), O)
     hair_dir = G.norm(G.add(G.scale(QZ, k_val), G.xyz(z=G.math("DIVIDE", gravity, UNIT))))
     rdir = G.switch("VECTOR", G.int_eq(mode, 2), G.scale(QZ, G.attr("hg_rs_sign", "FLOAT")), hair_dir)
-    rsel = G.boolean("AND", G.int_eq(G.attr("hg_order", "INT"), rs_in.outputs["Order"]),
+    rsel = G.boolean("AND", G.int_eq(G.attr("hg_level", "INT"), rs_in.outputs["Order"]),
                      G.boolean("NOT", G.int_eq(mode, 0)))
     rgeo = G.store(rcur, "hg_v", G.xyz(), "FLOAT_VECTOR", selection=rsel)
     rgeo = G.store(rgeo, "hg_aprev", ranchor, "FLOAT_VECTOR", selection=rsel)
@@ -945,7 +1660,7 @@ def _physics_node_group():
     node_in, node_out = G.repeat(step_in.outputs["Geometry"], orders, counter="Order")
     cur = node_in.outputs["Geometry"]
     order = node_in.outputs["Order"]
-    selected = G.int_eq(G.attr("hg_order", "INT"), order)
+    selected = G.int_eq(G.attr("hg_level", "INT"), order)
     p0, v0, aprev = position, G.attr("hg_v", "FLOAT_VECTOR"), G.attr("hg_aprev", "FLOAT_VECTOR")
     anchor = G.switch("VECTOR", G.attr("hg_start", "BOOLEAN"),
                       G.sample(cur, position, G.attr("hg_prev", "INT"), "FLOAT_VECTOR"), O)
@@ -1076,7 +1791,7 @@ def _physics_node_group():
     # for aprons, and for the other chains the previous bone's written Y (a
     # chain start: its own animated Y), so it is built in node order
     wb_in, wb_out = G.repeat(G.store(result, "hg_wy", Y, "FLOAT_VECTOR"),
-                             G.math("ADD", G.stat_max(result, G.attr("hg_order", "INT")), 1.0), counter="Order")
+                             G.math("ADD", G.stat_max(result, G.attr("hg_level", "INT")), 1.0), counter="Order")
     wcur = wb_in.outputs["Geometry"]
     worder = wb_in.outputs["Order"]
     prev_index = G.attr("hg_prev", "INT")
@@ -1091,7 +1806,7 @@ def _physics_node_group():
     written = G.norm(G.cross(G.cross(aim, up), aim))
     written = G.switch("VECTOR", is_type["jiggle"], written, Y)        # chests keep their animated axes
     G.put(wb_out.inputs["Geometry"], G.store(wcur, "hg_wy", written, "FLOAT_VECTOR",
-                                             selection=G.int_eq(G.attr("hg_order", "INT"), worder)))
+                                             selection=G.int_eq(G.attr("hg_level", "INT"), worder)))
     G.put(wb_out.inputs["Order"], G.math("ADD", worder, 1.0))
     framed = wb_out.outputs["Geometry"]
 
@@ -1124,6 +1839,35 @@ def _physics_up_group():
     axis = G.sample(proxy, G.attr("hg_wy", "FLOAT_VECTOR"), index, "FLOAT_VECTOR")
     G.put(gout.inputs["Geometry"], G.set_position(gin.outputs["Geometry"], G.add(point, G.scale(axis, UNIT))))
     return nt
+
+
+def _physics_levels(nodes: list) -> list[int]:
+    """The pass in which each node is stepped. The game steps nodes one by one
+    in `order`; a node reads its anchor (the previous node of its chain, as
+    updated this step) and robes and aprons their partner (updated or not,
+    whichever comes first in the game's order). Nodes whose reads are already
+    settled can be stepped together, so: a node is after its anchor and after
+    a partner the game updates earlier, and not after a partner the game
+    updates later (it must still read that partner's old position)."""
+    level = [0] * len(nodes)
+    by_order = sorted(range(len(nodes)), key=lambda i: nodes[i]["order"])
+    reads_partner = [n["partner"] >= 0 and n["kind"] in ("robe", "apron") for n in nodes]
+    changed = True
+    while changed:
+        changed = False
+        for j in by_order:
+            n = nodes[j]
+            need = level[j]
+            if n["prev"] >= 0:
+                need = max(need, level[n["prev"]] + 1)
+            p = n["partner"]
+            if reads_partner[j] and nodes[p]["order"] < n["order"]:
+                need = max(need, level[p] + 1)
+            if need != level[j]:
+                level[j], changed = need, True
+            if reads_partner[j] and nodes[p]["order"] > n["order"] and level[p] < level[j]:
+                level[p], changed = level[j], True
+    return level
 
 
 def set_gn_input(obj, mod, identifier: str, value, frame=None) -> str:
@@ -1284,6 +2028,7 @@ def add_physics(scene, rigs: list, cuts: list, report: list, event: str = "") ->
         _set_attributes(proxy.data, {
             "hg_type": ("INT", [NODE_TYPES[n["kind"]] for n in nodes]),
             "hg_order": ("INT", [n["order"] for n in nodes]),
+            "hg_level": ("INT", _physics_levels(nodes)),
             "hg_cont": ("INT", [n["cont"] for n in nodes]),
             "hg_start": ("BOOLEAN", [n["prev"] < 0 for n in nodes]),
             "hg_prev": ("INT", [n["prev"] if n["prev"] >= 0 else i for i, n in enumerate(nodes)]),
@@ -1403,12 +2148,14 @@ def hide(obj) -> None:
 
 def main(argv: list[str], from_cli: bool) -> None:
     opts = {"--root": None, "--save": None, "--room-anims": "ambient", "--resolution": "1440x1080",
-            "--view-transform": "Standard"}
+            "--view-transform": None, "--look": "hybrid", "--time-of-day": "story",
+            "--character-shading": "game", "--render-space": "display"}
     flags = set()
     args = []
     i = 0
     while i < len(argv):
-        if argv[i] in ("--keep-current", "--no-sound", "--no-movie", "--no-cut-lighting", "--shadows", "--blended",
+        if argv[i] in ("--keep-current", "--no-sound", "--no-movie", "--no-cut-lighting", "--no-fog", "--shadows",
+                       "--blended", "--no-letterbox", "--end-fade", "--start-fade",
                        "--no-physics", "--bake-physics"):
             flags.add(argv[i])
         elif argv[i] in opts:
@@ -1524,19 +2271,38 @@ def main(argv: list[str], from_cli: bool) -> None:
         add_physics(scene, rigs, anim.get("cuts", []), report, cutscene.stem.upper())
 
     # 5. per-cut character lighting (the rooms themselves are pre-lit)
+    global DISPLAY_SPACE
+    game_shading = opts["--character-shading"] == "game"
+    if opts["--character-shading"] not in ("game", "physical"):
+        raise SystemExit("--character-shading must be game or physical")
+    if opts["--render-space"] not in ("display", "linear"):
+        raise SystemExit("--render-space must be display or linear")
+    DISPLAY_SPACE = opts["--render-space"] == "display" and game_shading
+    if opts["--render-space"] == "display" and not game_shading:
+        report.append("render space: linear (--character-shading physical needs scene-linear materials)")
+    if game_shading:
+        apply_game_shading(actor_objs, report)
     if "--no-cut-lighting" not in flags:
-        apply_cut_lighting(scene, camera, read_gltf_json(cutscene), room_refs, root, report)
+        apply_cut_lighting(scene, camera, read_gltf_json(cutscene), room_refs, root, report, game_units=game_shading)
+    apply_screen_effects(scene, actor_objs, room_objs, read_gltf_json(cutscene), room_refs, root, report,
+                         fog="--no-fog" not in flags, look=opts["--look"], time_of_day=opts["--time-of-day"],
+                         display=DISPLAY_SPACE)
+    apply_frame_overlays(scene, read_gltf_json(cutscene), report, letterbox="--no-letterbox" not in flags,
+                         end_fade="--end-fade" in flags, display=DISPLAY_SPACE,
+                         start_fade="--start-fade" in flags)
 
     # 6. match the game's rendering: no light shadows, depth-sorted translucency,
     #    colours shown as stored (the game has no tone mapping)
     match_game_rendering(actor_objs, room_objs, list(scene.objects), flags, report)
-    scene.view_settings.view_transform = opts["--view-transform"]
+    scene.view_settings.view_transform = opts["--view-transform"] or ("Raw" if DISPLAY_SPACE else "Standard")
     scene.view_settings.look = "None"
 
     # 7. the event movie: pre-rendered inserts or effect overlays
     movie = cutscene.with_suffix(".mp4")
     if "--no-movie" not in flags:
         add_movie_layer(scene, camera, read_gltf_json(cutscene), movie, report)
+    if DISPLAY_SPACE:                # after every material exists (the movie's too)
+        apply_display_space(scene, report)
 
     # 8. soundtrack in the sequencer at frame 0
     sound = cutscene.with_suffix(".wav")

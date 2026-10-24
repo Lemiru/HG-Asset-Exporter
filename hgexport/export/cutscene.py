@@ -18,6 +18,7 @@ scene).
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -135,6 +136,11 @@ def _rest(obj, s: float) -> tuple[list[float], tuple]:
     return [c * s for c in obj.translation], euler_to_quat(*obj.euler)
 
 
+def _door_rest(door, s: float) -> tuple[list[float], tuple]:
+    """A door node's placement, as the stage export writes it."""
+    return [c * s for c in door.position], euler_to_quat(*door.euler)
+
+
 def _event_extras(event_dir: Path, timeline: EventTimeline, report: dict) -> dict:
     """MARK.BIN frame marks and PARAMS.BIN per-cut parameters (formats/marks.py)."""
     extras: dict = {"fps": FPS, "frames": timeline.frames}
@@ -173,13 +179,18 @@ def _event_extras(event_dir: Path, timeline: EventTimeline, report: dict) -> dic
         extras["cut_parameters_note"] = (
             "applied when the cut starts. lighting: room light colours x room_light_scale, ambient + "
             "ambient_add, up to two directional lights (0-255 colours) whose direction is the camera view "
-            "direction turned by angles[0] about the camera's horizontal axis and by angles[1] about world up "
-            "(radians). depth_effect: four distances (likely depth-of-field ranges). fog: RGBA colours, "
+            "direction turned by angles[0] about the camera's horizontal axis (positive: down, light from above) "
+            "and by angles[1] about the up axis (positive: to the right, light from the left) (radians). depth_effect: four distances (likely depth-of-field ranges). fog: RGBA colours, "
             "start/end distance (game units, 1 = 0.1 m)")
         report["cut_parameters"] = len(records)
     movie = event_movie(event_dir, timeline)
     if movie:
         extras["movie"] = movie
+    from .look import cutscene_story_state
+    extras["story_state"] = cutscene_story_state(event_dir.name)
+    extras["story_state_note"] = ("story flags and phase when the cutscene plays in the story; they pick the "
+                                  "rooms' script_variants (room_effects) - the movie gallery plays everything "
+                                  "with no story flags set")
     return extras
 
 
@@ -329,6 +340,9 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
     cut_rooms: list[Path | None] = [None] * len(cuts)
     # pac -> object name -> [node (None until first used), rest translation, rest rotation, node name, parent]
     room_objects: dict[Path, dict[str, list]] = {}
+    # pac -> door index -> [node (None until first used), rest translation, rest rotation, node name, parent,
+    #                       placement Euler]
+    room_doors: dict[Path, dict[int, list]] = {}
     if opts.room:
         if opts.room_override:
             name = opts.room_override.upper()
@@ -348,6 +362,8 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
                 room_root = sb.root
                 room_objects[pac] = {o.name: [sb.object_nodes[o.name], *_rest(o, s), None, room_root]
                                      for o in stage.objects if o.name in sb.object_nodes}
+                room_doors[pac] = {d.index: [sb.door_nodes[d.index], *_door_rest(d, s), None, room_root, d.euler]
+                                   for d in stage.doors if d.index in sb.door_nodes and d.euler is not None}
             else:
                 # Empty stand-in named like the stage export's root node; object
                 # nodes are added only for objects the props animate.
@@ -361,11 +377,42 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
                     if o.name and o.name not in room_objects[pac] and o.record.vertex_count:
                         room_objects[pac][o.name] = [None, *_rest(o, s),
                                                      f"{stage.name}_obj{o.index:03d}_{o.name}", room_root]
+                room_doors[pac] = {d.index: [None, *_door_rest(d, s), f"{stage.name}_door{d.index}", room_root,
+                                             d.euler]
+                                   for d in stage.doors if d.records and d.position is not None
+                                   and d.euler is not None}
             if len(distinct) > 1:
                 vis = _Track()
                 for (cut, _d), room in zip(cuts, cut_rooms):
                     vis.segment(cut.start, [(1.0, 1.0, 1.0) if room == pac else (0.0, 0.0, 0.0)])
                 channels.append((room_root, "scale", vis, "STEP"))
+
+    # ------------------------------------------------------------------- doors
+    # DP sections 32 + k animate room door k in the cuts whose DH door mask
+    # has bit k (the director's Doors_TurnTo 0x221A90): the key's Y angle
+    # replaces the door's heading, which it keeps after the cut. Every shipped
+    # door track is section 32 (door 0).
+    door_tracks: dict[tuple, _Track] = {}
+    door_props: set[int] = set()
+    for (cut, data), room in zip(cuts, cut_rooms):
+        doors = room_doors.get(room, {})
+        for i, prop in enumerate(data.props):
+            k = prop.section - 32
+            if not (0 <= k < 8 and cut.aux_mask >> k & 1) or k not in doors:
+                continue
+            door_props.add(id(prop))
+            entry = doors[k]
+            if entry[0] is None:
+                entry[0] = b.node({"name": entry[3], "translation": list(entry[1]), "rotation": list(entry[2])})
+                b.add_child(entry[4], entry[0])
+            track = door_tracks.setdefault((room, k), _Track())
+            if not track.times and cut.start > 0:
+                track.segment(0, [entry[2]])              # placement heading until the door moves
+            ex, _ey, ez = entry[5]
+            track.segment(cut.start, [euler_to_quat(ex, v[1], ez) for v in prop.samples], cut.frames)
+    for (room, k), track in door_tracks.items():
+        channels.append((room_doors[room][k][0], "rotation", track, "LINEAR"))
+    report["doors_animated"] = sorted(f"{room.stem}_door{k}" for room, k in door_tracks)
 
     # ------------------------------------------------------------------- props
     prop_nodes: dict[str, int] = {}
@@ -375,6 +422,8 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
         seen: dict[str, int] = {}
         objects = room_objects.get(room, {})
         for prop in data.props:
+            if id(prop) in door_props:
+                continue
             base = f"{prop.section}_{prop.name}"
             seen[base] = seen.get(base, 0) + 1
             target = objects.get(prop.name) if seen[base] == 1 else None
@@ -415,6 +464,61 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
         channels.append((node, "translation", tt, "LINEAR"))
         channels.append((node, "rotation", tr, "LINEAR"))
     report["props_bound_to_room_objects"] = sorted(k.split(":")[-1] for k in bound_rest)
+
+    # The room objects listed in the DH prop groups are shown only in the cuts
+    # that animate their group; groups the event uses at all are hidden in the
+    # other cuts (Cutscene_StartShot; groups in order, the last one decides).
+    used_groups = 0
+    for cut, _d in cuts:
+        used_groups |= cut.prop_mask
+    shown: dict[tuple, _Track] = {}
+    cut_state: dict[int, dict[str, bool]] = {}
+    for (cut, _data), room in zip(cuts, cut_rooms):
+        objects = room_objects.get(room, {})
+        state: dict[str, bool] = {}
+        cut_state[cut.index] = state
+        for g in range(8):
+            if not used_groups >> g & 1:
+                continue
+            for name in timeline.prop_groups.get(g, []):
+                if name in objects:
+                    state[name] = bool(cut.prop_mask >> g & 1)
+        for name, on in state.items():
+            target = objects[name]
+            if target[0] is None:
+                target[0] = b.node({"name": target[3], "translation": list(target[1]), "rotation": list(target[2])})
+                b.add_child(target[4], target[0])
+            shown.setdefault((room, name), _Track()).segment(cut.start, [(1.0, 1.0, 1.0) if on else (0.0, 0.0, 0.0)])
+    for (room, name), track in shown.items():
+        channels.append((room_objects[room][name][0], "scale", track, "STEP"))
+    report["props_shown_per_cut"] = sorted({name for _room, name in shown})
+
+    # Event doors: some cutscenes swing a room object of their own (ev_door,
+    # ev_door_a / ev_ddor_b, demo_door0..2) that stands in a gameplay door's
+    # doorway; the gameplay door is hidden while it is shown (EV0004, EV0011,
+    # EV0027, EV0028), else the closed door covers it.
+    replaced = []
+    for pac, doors in room_doors.items():
+        objects = room_objects.get(pac, {})
+        event_doors = [n for n in objects if re.search(r"d[od]or", n, re.IGNORECASE)]
+        for k, entry in doors.items():
+            near = [n for n in event_doors
+                    if math.dist((objects[n][1][0], objects[n][1][2]), (entry[1][0], entry[1][2])) < 15 * s]
+            if not near:
+                continue
+            track = _Track()
+            for (cut, _data), room in zip(cuts, cut_rooms):
+                if room == pac:
+                    present = any(cut_state.get(cut.index, {}).get(n) for n in near)
+                    track.segment(cut.start, [(0.0, 0.0, 0.0) if present else (1.0, 1.0, 1.0)])
+            if not any(v == (0.0, 0.0, 0.0) for v in track.values):
+                continue
+            if entry[0] is None:
+                entry[0] = b.node({"name": entry[3], "translation": list(entry[1]), "rotation": list(entry[2])})
+                b.add_child(entry[4], entry[0])
+            channels.append((entry[0], "scale", track, "STEP"))
+            replaced.append(f"{pac.stem}_door{k}")
+    report["doors_replaced_by_event_doors"] = sorted(replaced)
 
     # --------------------------------------------------------------- animation
     samplers, chans = [], []

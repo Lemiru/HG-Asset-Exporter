@@ -83,21 +83,26 @@ run updates the matching entries in `manifest.json` and keeps the rest.
 
 The game names its folders and files with short codes. Folders starting with
 `O_` hold characters, `ST_` rooms, `EV` story cutscenes and `DE` mostly
-death and game-over scenes. The main character codes:
+death and game-over scenes. The character codes:
 
 | Code | Character |
 | --- | --- |
 | `FIN` | Fiona, the heroine, in her main outfit |
 | `FIS`, `FIW` | Fiona early in the game (`FIS`: wrapped in a sheet) |
-| `FIB`, `FIC`, `FIF`, `FIH`, `FIM`, `FIO` | Fiona's unlockable costumes |
-| `HEW`, `HED`, `HEG` | Hewie, the dog |
+| `FIB`, `FIC`, `FIF`, `FIH`, `FIM`, `FIO` | Fiona's unlockable costumes (`FIF`: the frog suit) |
+| `HEW` | Hewie, the dog |
+| `HEG`, `HED` | Hewie's alternative looks: a German shepherd, a plush toy dog |
 | `DB0`, `DB1`, `DB2` | Debilitas |
 | `DNL` | Daniella |
 | `RCG`, `RCT` | Riccardo |
-| `LRM`, `LRY`, `LRO`, `LRF`, `LRC`, `LRH` | Lorenzo in his different forms |
+| `LRM`, `LRY`, `LRO` | Lorenzo |
+| `LRC`, `LRF`, `LRH` | Lorenzo's glowing golden form (`LRH`: its arm alone) |
+| `GLM`, `HMA`, `HMB`, `SGM` | creatures: a golem, a pale humanoid, a fleshy creature, an emaciated humanoid |
+| `CRW`, `RBT`, `FS0`–`FS2` | animals: a crow, a rabbit, three kinds of fish |
+| `HND`, `WHC`, `WIR`, `SHT`, `DNT` | props: an arm and hand, a wheelchair, a coil spring, a cloth sheet, a pink fleshy slab |
 | `T00` | an early prototype of Fiona left on the disc |
 
-The other folders hold minor characters, creatures and props. Inside a
+The descriptions of the minor codes come from looking at the models. Inside a
 folder, `_000` is the main model, `_200` the more detailed version used in
 cutscenes, and `_001`, `_002`, … are animation sets for the same model (see
 [Animation variants](#things-worth-knowing-about-the-exports)).
@@ -178,8 +183,12 @@ are exported as animation-only files named after that pursuer
 `FIN_000` skeleton. Hewie's `HEW_001`…`HEW_004` are his per-chapter
 animation sets, named the same way.
 
-**Faces and hands** are blend shapes (shape keys): `face_01`…`face_15` for
-the facial expressions and `hand_l_01`…`hand_l_09` / `hand_r_01`…`hand_r_09`
+**Faces and hands** are blend shapes (shape keys). The 15 facial shapes are
+named by number and by what they move: `face_01_mouth`…`face_06_mouth`,
+`face_07_blink_*` and `face_08_blink_*` (one eyelid each, `_L` or `_R` for
+the character's own side), `face_09_brow`…
+`face_12_brow` and `face_13_expression`…`face_15_expression`. The hands
+have `hand_l_01`…`hand_l_09` / `hand_r_01`…`hand_r_09`
 for the hand poses. The default weights give the game's relaxed hand pose.
 Gameplay animations of Fiona and Debilitas also animate the hands, as the
 game does.
@@ -191,7 +200,15 @@ triangle from the texture: solid parts are opaque, clean cut-outs (lace
 holes, hair-card edges, foliage) use alpha clipping, and only genuinely soft
 areas (hair ends, eyelashes, sheer lace, glass) are alpha-blended. This
 keeps engines from sorting large opaque surfaces as transparent.
-`--game-alpha` instead keeps the game's own, coarser choice. Alternative
+`--game-alpha` instead keeps the game's own, coarser choice.
+Some parts (skin, Fiona's pendant, Debilitas' metal ring and keys) have a highlight
+in the game. It is saved as grey masks next to the textures
+(`textures/O_FIN/FIN_000_m00_shine.png`; `m00` is the texture sheet, as in
+the material names), and `--specular` also builds it into the materials as
+glTF specular and roughness (see
+[FORMATS.md](docs/FORMATS.md#how-models-are-drawn-and-what-that-means-for-transparency)).
+The game computes the highlight but never shows it, so the default
+materials leave it out. Alternative
 texture sets (the detailed cutscene face, story-dependent versions) are
 glTF *material variants*. Each material's extras name its source image, for
 example `FIN_000.TEX#1`, which is `textures/O_FIN/FIN_000_1.png`.
@@ -200,7 +217,23 @@ example `FIN_000.TEX#1`, which is `textures/O_FIN/FIN_000_1.png`.
 plus up to 16 lights per room (it picks the three strongest for where the
 character stands). They are exported as glTF punctual lights under
 `<room>_lights`; brightness assumes the game's full value equals 2000 lux,
-so adjust to taste.
+so adjust to taste. The game applies the light to the texture's on-screen
+value rather than in linear light, so physically lit materials look brighter
+than the game in dim scenes; the Blender assembly script reproduces the
+game's shading (see [docs/BLENDER_CUTSCENES.md](docs/BLENDER_CUTSCENES.md)).
+
+**Screen look (night and day).** Each room has a colour mood that the
+game paints over the finished picture: a *tint* (a soft coloured glow and
+local contrast, blue at night), fog, and a *bloom* around its lamps. The
+values are in the room's extras (`room_effects`), with the warm variants
+some rooms use early in the story; the lamps are a separate `<room>_glow`
+object (`--emissive-glow` makes them emissive for engines). The Blender
+assembly script rebuilds the effects (`--look hybrid`, `emulate` or
+`modern`; `--time-of-day`), rendering in display values as the PS2 does
+(`--render-space`), with the game's letterbox (`--no-letterbox`) and,
+optionally, the gallery's end fade (`--end-fade`); see
+[docs/BLENDER_CUTSCENES.md](docs/BLENDER_CUTSCENES.md) and, for how the game
+does it, [docs/FORMATS.md](docs/FORMATS.md#screen-look-tint-glow-geometry-and-bloom).
 
 **Cameras.** The game's field-of-view values are horizontal; exported
 cameras use the matching vertical value for a 4:3 picture. Render cutscenes
@@ -228,12 +261,15 @@ renders.
   assembly script reproduces the cloth and hair physics (see
   [docs/SECONDARY_MOTION.md](docs/SECONDARY_MOTION.md)).
 * **Which optional room objects a cutscene shows.** Some rooms contain
-  objects that the game's event scripts switch on and off (a second moon, a
-  pile of broken glass). Those scripts are not decoded, so all such objects
-  are visible; they are marked so you can hide them (see the Blender guide).
+  objects that the rooms' event scripts switch on and off (a second moon, a
+  pile of broken glass). The exporter does not read those scripts yet, so
+  all such objects are visible; they are marked so you can hide them (see
+  the Blender guide).
 * **Curtain colour changes** cannot be expressed in glTF; curtains get a
   generic open/close animation where the game's controller is unknown.
-* **Room fog** is exported as data but not applied to the scenes.
+* **Fog** is exported as data in the room and cutscene files; the Blender
+  assembly script applies it, other programs need their own setup (the
+  formula is in [docs/FORMATS.md](docs/FORMATS.md#fog)).
 
 ## Project layout and tests
 

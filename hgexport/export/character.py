@@ -26,6 +26,7 @@ class CharacterOptions:
     animations: bool = True
     morphs: bool = True
     game_alpha: bool = False            # keep the game's blend flag as BLEND (default: alpha mode per element)
+    specular: bool = False              # the game's per-part shine as KHR_materials_specular (export/shine.py)
     bleed: bool = False                 # fill the colour under alpha-0 texels (no dark fringes; not the game's look)
     texture_variant: str = "default"
     material_variants: bool = True      # KHR_materials_variants for alternate texture sheets
@@ -146,6 +147,30 @@ def _part_groups(model: PckModel, opts: "CharacterOptions") -> dict[tuple[str, i
     return groups
 
 
+def _face_regions(face: list) -> dict[int, str]:
+    """Names for the 15 facial shapes, from what they move (measured on every
+    character with a face; the game's facial controls address them by
+    number): 1-6 the mouth, 7 and 8 one eyelid each, 9-12 the brows, 13-15
+    broader expressions. The eyelids' side
+    differs per character, so it is taken from the geometry: the face looks
+    along +Z with Y up, so the character's left is +X."""
+    d = max(face, key=lambda x: len(x.uvs))
+    if len(d.shapes) != 16:
+        return {}
+    names = {k: "mouth" for k in range(1, 7)}
+    names.update({k: "brow" for k in range(9, 13)})
+    names.update({k: "expression" for k in range(13, 16)})
+    base = d.shape_positions(0)
+    for k in (7, 8):
+        moved = [(sum((a - b) ** 2 for a, b in zip(p, q)) ** 0.5, q[0]) for p, q in zip(d.shape_positions(k), base)]
+        total = sum(w for w, _x in moved)
+        side = sum(w * x for w, x in moved) / total if total else 0.0
+        names[k] = "blink_L" if side > 0 else "blink_R"
+    if names[7] == names[8]:                  # not one eye each: leave the side out
+        names[7] = names[8] = "blink"
+    return names
+
+
 def _bone_names(model: PckModel, prefix: str) -> list[str]:
     """Joints are named by their bone-palette slot (the index animation data
     uses), so clips bind to any model of the same rig family by name.
@@ -180,6 +205,10 @@ class CharacterBuilder:
         self.factory = (MaterialFactory(self.b, textures.images, prefix, textures.sources, opts.unlit,
                                        opts.bleed)
                         if textures else None)
+        if self.factory and opts.specular:
+            from .shine import shine_masks
+            self.factory.shine = shine_masks(model, textures.images)[0]
+            self.factory.specular = True
 
     def _node(self, node: dict, top: bool) -> int:
         if top and self.opts.root_motion and "extras" in node and "bone_index" in node["extras"]:
@@ -263,9 +292,10 @@ class CharacterBuilder:
         names: list[str] = []
         if face:
             label = "face" if hands else "shape"
+            regions = _face_regions(face) if hands else {}
             for s in range(1, max(len(d.shapes) for d in face)):
                 self.face_targets[s] = len(names)
-                names.append(f"{label}_{s:02d}")
+                names.append(f"{label}_{s:02d}" + (f"_{regions[s]}" if s in regions else ""))
         for d in m.morphs:
             if d.topology_mode == 1:
                 self.descriptor_targets[d.index] = dict(self.face_targets)
@@ -529,8 +559,12 @@ class CharacterBuilder:
                 if ts.images is self.textures.images:
                     self._variant_factories[name] = self.factory
                 else:
-                    self._variant_factories[name] = MaterialFactory(
+                    factory = MaterialFactory(
                         self.b, ts.images, f"{self.model.name}_{name}", ts.sources, self.opts.unlit, self.opts.bleed)
+                    if self.factory.specular:            # same UV layout, the variant's sheet sizes
+                        from .shine import shine_masks
+                        factory.shine, factory.specular = shine_masks(self.model, ts.images)[0], True
+                    self._variant_factories[name] = factory
         groups: dict[int, list[int]] = {}
         for name, factory in self._variant_factories.items():
             if factory is self.factory or factory.images[component] is self.factory.images[component]:

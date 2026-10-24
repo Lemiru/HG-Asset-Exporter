@@ -115,8 +115,9 @@ def _rgba(b: bytes) -> list[int]:
 
 
 def parse_room_effects(pac: Pac) -> dict:
-    """Slot 13 effect parameters (same layouts as the cutscene PARAMS.BIN
-    effects 28/29; effects 30/31 are screen colour effects)."""
+    """Slot 13 effect parameters: the tint (effect 31), the bloom (effect 30),
+    the fog and the depth effect (same layouts as the cutscene PARAMS.BIN
+    effects 29 and 28). See export/look.py for how the game draws them."""
     # Some rooms' parameter blocks lie past the next slot's start, so read
     # from the slot start to the end of the file.
     if not pac.slots[13]:
@@ -128,11 +129,10 @@ def parse_room_effects(pac: Pac) -> dict:
     out: dict = {}
     if o31:
         b = data[o31:o31 + 9]
-        out["color_effect_31"] = {"colors": [_rgba(b[0:4]), _rgba(b[4:8])], "mode": b[8]}
+        out["tint"] = {"colors": [_rgba(b[0:4]), _rgba(b[4:8])], "mode": b[8]}
     if o30:
         b = data[o30:o30 + 5]
-        out["color_filter_30"] = {"color": _rgba(b[0:4]), "mode": b[4],
-                                  "note": "modes 2-4 replace the colour with a fixed one"}
+        out["bloom"] = {"color": _rgba(b[0:4]), "mode": b[4]}
     if o29:
         b = data[o29:o29 + 26]
         out["fog"] = {"colors": [_rgba(b[0:4]), _rgba(b[4:8])],

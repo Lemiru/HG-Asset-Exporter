@@ -216,7 +216,13 @@ normals are stored in the order Y, Z, X.
 Characters use descriptors 0 and 3 for the face and the teeth/eyelashes (16
 shapes each) and 1 and 2 for the left and right hand (10 shapes each). The
 game drives face and teeth with the same controls, so the export gives them
-shared targets (`face_01`…`face_15`); hands become `hand_l_01`… and
+shared targets named by number and region: `face_01_mouth`…`face_06_mouth`,
+`face_07_blink_R`/`_L` and `face_08_blink_L`/`_R` (one eyelid each; their
+order differs per character, so the side comes from the geometry: faces look
+along +Z with Y up, so the character's left is +X), `face_09_brow`…
+`face_12_brow` and `face_13_expression`…`face_15_expression` (measured on every
+character with a face). Hands
+become `hand_l_01`… and
 `hand_r_01`…. The game's resting hand pose is shape 1 of each hand, which is
 the exported default.
 
@@ -242,6 +248,34 @@ flagged ones are solid except along hems, fringes and hair ends.
 A byte per mesh in the character object (`+136 + 2i`) is combined with the
 mesh's flags when drawing; its bit 1 hides the mesh. The game uses this to
 switch accessories on and off.
+
+The value 4 in the same byte selects lit drawing programs that add a
+highlight (`max(R·V, 0)^4` times each light's strength), and the byte after
+it is the highlight's strength (128 = 1.0). These "shine" bytes are not in
+the model files: each character class writes fixed values when its model
+has loaded (Fiona's main outfit: `EventHumanModel_Loaded`, `0x2F7920`). The
+values were read from those routines and checked in emulator save states;
+`hgexport/export/shine.py` lists them for Fiona's outfits, Daniella,
+Debilitas, Riccardo and Lorenzo. Meshes are numbered skinned first, then
+rigid, then blend-shape pieces.
+
+In the game the highlight only goes into the pixel's alpha, and the game
+clears the frame's alpha after drawing the characters, before its bloom
+reads it (see [Screen look](#screen-look-tint-glow-geometry-and-bloom)), so
+it never shows in normal play. The exporter therefore paints it into grey masks, one per texture sheet
+(`textures/<folder>/<model>_mNN_shine.png`, grey 128 = 1.0), and uses it in
+materials only when asked (`--specular`). Shiny sheets then get a roughness
+of 0.58 where the mask is set (the game's exponent 4 as a GGX roughness) and
+a reflectance chosen so that the highlight's peak matches the game's: at its
+peak the game adds strength × the light, which GGX at that roughness reaches
+with F0 = 4/9 × strength (0.22 for the common strength 64). The sheet's
+strongest shine sets F0 through `KHR_materials_ior` (IOR 2.78 for 64, 5.0 for
+128), and `KHR_materials_specular` scales it by the mask and tints it by the
+texture itself (`specularColorTexture` = the base colour), as the game's
+bloom would brighten the frame by its own colour. A white highlight of that
+strength turns dark cloth grey (the stocking tops share the skin's strength)
+and washes the pendant's detail out. Sheets without shiny meshes get no
+specular at all.
 
 ### Shadow volumes
 
@@ -349,7 +383,7 @@ Animations run at 30 frames per second (verified against cutscene audio).
 | −2, −3 | positions of the two foot bones | `foot_points` (only where they differ, see below) |
 | −4 | foot contact flags | `foot_contact` |
 | −5, −6 | Hewie's paw contacts (hind, front) | `foot_contact` |
-| −7…−10 | facial controls (16 values; control *k* drives shape *k* of every face piece) | `face_01`…`face_15` weights |
+| −7…−10 | facial controls (16 values; control *k* drives shape *k* of every face piece) | `face_01_…`…`face_15_…` weights |
 | −11, −12 | hand mixers for hand 1 and 2: `shape[A]·(1−mix) + shape[B]·mix` | `hand_l_…`, `hand_r_…` weights |
 
 **Feet (−2…−6).** Tracks −2 and −3 store where the rig's two foot bones are
@@ -418,7 +452,7 @@ slot's data ends where the next different offset begins.
 | 10 | room text | `text/rooms/` |
 | 11 | a table that is empty in every room | — |
 | 12 | named (movable) objects | `<room>_objNNN_<name>` nodes |
-| 13 | screen effects (fog, colour filter, depth effect) | `room_effects` extras |
+| 13 | screen effects (tint, bloom, fog, depth effect) | `room_effects` extras |
 | 14 | switchable floor groups | `floor_groupNN` in the navmesh file |
 | 15 | authored object motion | `<object>_motion<k>` clips |
 | 16 | per-triangle navigation overrides | navmesh file |
@@ -434,16 +468,27 @@ UVs 2×f32 | align to 16 | colours 4×u8 (0x80 = 1.0) | align | positions 3×f32
 ```
 
 Slot 3 starts with six group offsets; each group is a run of records ended
-by `−1, −1`. Groups 0–2 are normal geometry, group 4 animated textures,
+by `−1, −1`. Groups 0 and 1 are normal geometry, group 2 the **glow
+geometry** (lamps, candle flames, lamp shades: drawn after the screen tint
+and fog and marking the bloom, see [Screen look](#screen-look-tint-glow-geometry-and-bloom);
+exported as `<room>_glow`), group 4 animated textures,
 group 5 blended effects drawn without depth writes (`extra` bit 8 =
 additive). Control bit 0 turns on alpha blending; the top byte is a
 **visibility selector** that event scripts switch on and off (0 = always
 visible). Objects with a selector are exported in `…_selNNN` nodes with the
 `visibility_selector` extra.
 
+Untextured records (texture −1: mostly the glow geometry's bulbs) show the
+vertex colour itself on a 0–255 scale; textured ones multiply the texture
+by it with 0x80 = 1.0.
+
 The vertex colours carry the room's painted-in lighting (0x80 = full
 brightness); the export converts them to linear `COLOR_0` and uses unlit
-materials. Transparency follows the same per-triangle rules as for
+materials. The GS interpolates them, multiplies the texture by them
+(`(T × V) >> 7`, rounding down) and blends translucent layers in display
+values; renderers that do these in linear light show dark gradients and
+fading layers brighter than the game (5–15 % in dark rooms; see the Blender
+guide's *render space*). Transparency follows the same per-triangle rules as for
 characters, with the vertex alpha taken into account (fades never become
 opaque); baked floor shadows and effects stay blended.
 
@@ -520,6 +565,13 @@ range², param` (colours on a 0–255 scale, `w` an intensity multiplier, mostly
 Each floor triangle's last word (+76) is a 16-bit mask of the lights that
 may reach a character standing on it; the game uses the three strongest of
 those (strength = (0.3 R + 0.6 G + 0.1 B) × w × (range − distance) / range).
+The character's vertex colour is then the ambient plus each of the three
+lights' colour × w × the falloff × max(N · L, 0) (direction from the light to
+the character's position), with 128 = 1.0, and the GS multiplies the
+texture's display value by it: an ambient of 128 shows the texture as it is
+(checked in an emulator). Cutscenes scale the lights, raise the ambient and
+put their two camera lights (no falloff) into slots 2 and 1 (PARAMS.BIN,
+type 0).
 882 lights in 166 rooms (795 point, 87 directional). The export assumes the
 game's full value of 128 equals 2000 lux and matches the game's linear
 falloff at half the range (at most 2.5 m), so wide lights are not too bright
@@ -545,12 +597,78 @@ up close.
 
 ### Screen effects (slot 13)
 
-Offsets at +8, +12, +16 and +20 to the settings of four screen effects: two
-colours and a mode (effect 31), a colour filter (effect 30), fog (effect 29,
-same layout as the cutscene fog below) and a depth effect (effect 28, as in
-cutscenes). Two rooms point past the end of their file; those values read as
-zero. Exported as `room_effects` in the room's extras (not applied to the
-scene).
+Offsets at +8, +12, +16 and +20 to the settings of four screen effects: the
+**tint** (two RGBA colours and a mode byte), the **bloom** (an RGBA colour
+and a mode byte), fog (same layout as the cutscene fog below) and a depth
+effect (as in cutscenes). Two rooms point past the end of their file; those
+values read as zero. Exported as `room_effects` (`tint`, `bloom`, `fog`,
+`depth_effect`) in the room's extras. When a room loads, the game creates its
+fog from the two colours and the two distances only (the rest of the block
+is ignored), so a room's fog always covers everything; see [Fog](#fog) for
+how it is drawn. The Blender assembly script applies all of them to
+cutscenes.
+
+#### Screen look: tint, glow geometry and bloom
+
+These give each room its colour mood. The game draws them in display values
+(0–255) over the finished 3D picture, in this order (renderer layers; read
+from the GS packets the game builds and checked on paused frames in an
+emulator):
+
+1. **Tint** (layer 0x20), once for each of its two colours that has alpha.
+   The frame is point-sampled to half size (256 × 224); that copy plus a
+   quarter of each of 8 copies shifted by (±1, ±1), (±2, 0) and (0, ±2)
+   half-size pixels gives a glow buffer G, about 3 × a blur of the picture,
+   clamped at 255. G is enlarged again (bilinear), multiplied by the colour
+   (128 = 1.0), and:
+   * colour 1 adds `G × colour1 × alpha1/256` to the frame (a soft glow);
+   * colour 2 adds `(frame − G × colour2) × alpha2/256` (local contrast;
+     darkening where `3 × colour2` is above 1.0). Its G is taken after
+     colour 1.
+   The mode byte (0 in every room) would skip the blur. Taken together
+   (with blur(blur) as blur), the two passes are a per-channel curve on the
+   blurred picture plus a fixed detail gain: `frame' = F(B) + (1 + alpha2/256)
+   × (frame − B)`, where F follows the clamps above; the exporter writes F
+   sampled as `room_effects.engine_look.<variant>.grade`.
+2. **Fog** (layer 0x21; [Fog](#fog)).
+3. Layer 0x25 clears the frame's alpha and turns on FBA, so everything drawn
+   until layer 0x27 gets alpha ≥ 0x80. Layer 0x26 draws the **glow
+   geometry**: room geometry group 2 (125 rooms; mostly untextured bulbs and
+   flames) and room objects whose name starts with `g_` (only
+   `g_chandelie` in ST_020). It is drawn normally, after the tint and fog,
+   so lamps keep their own colour. Characters are drawn before layer 0x25,
+   so nothing of theirs reaches the bloom.
+4. **Bloom** (layer 0x28): the frame's pixels with alpha ≠ 0 (the glow
+   geometry) are point-sampled to half size (A); B = 0.5 × the sum of 8
+   copies of A shifted as above; then A += 0.125 × the sum of 8 copies of B
+   shifted by (±3, 0), (0, ±3) and (±2, ±2); A, enlarged, adds
+   `A × colour × alpha/256` to the frame. Modes 1 and 4 would subtract and
+   2–4 pulse fixed colours; no room or script uses them.
+
+**Night and warm.** The rooms' own tints (mostly a blue first colour) are
+the night look. When a room is entered, its event script can replace the
+tint (command 0x33 to effect 0x1F) and the bloom (command 0x9B) under a story
+condition. Rooms 0x09–0x2D (most of the first area) switch to a warm tint
+until story flag 2 is set (room 0x21 until flag 1); rooms 0xE0–0xE9 while the
+story phase variable 0x2E is 1; rooms 0x00 and 0xE9 also get a strong blue
+bloom then. Flag 2 is set when Fiona first leaves room 0x21 after EV0002,
+flag 1 by an examine event in room 0x12, so only EV0002 and EV0003 play in
+the warm look in the story. The movie gallery plays every cutscene with no
+story flags set, so it shows the warm look in all of these rooms. The
+exporter lists the replacements as `room_effects.script_variants` with their
+conditions (`hgexport/export/look.py`) and each cutscene's story flags as
+`story_state` in the cutscene's extras. Rooms 0x35 and 0x92 change their
+look after a cutscene (EV0033, DE0048), not during it.
+
+**Optional objects (visibility groups).** The room geometry's records carry
+a visibility group in the top byte of their control word (exported as
+`…_selNNN` nodes). When a room loads, the game switches every group off;
+room event scripts switch them on and off with script command 0x4C, which
+sets group *a* + 1 + *b* (the progress method `+0x68`, `0x39BAE0`, on the
+room manager's mask at `+0x6C`). A gameplay save state shows groups 23 and
+25 on in the room it was made in. Which groups a cutscene shows therefore
+depends on the room scripts, which the exporter does not read yet, so all
+groups are exported visible.
 
 ---
 
@@ -559,6 +677,12 @@ scene).
 *121 events with 832 shots. Exported as `cutscenes/<event>/<event>.glb`
 with the soundtrack and movie layer. Timing verified against the audio:
 30 frames per second.*
+
+The game draws every cutscene letterboxed: black bars over the top and
+bottom 56 of the 448 lines (a 640 × 336, 16:9 picture); the camera's field
+of view covers the whole 4:3 frame under them. In the movie gallery, every
+event fades in from black (black up to frame 1, full at frame 17) and to
+black at its end (the last 14 frames), 1/16 per frame, on the game's clock.
 
 Each event folder holds a timeline (`.DH`), the animation data (`.DP`),
 per-frame flags (`MARK.BIN`), per-shot settings (`PARAMS.BIN`) and a movie
@@ -570,18 +694,28 @@ with the soundtrack (`.SFD`).
 = none; each list is `u32 count, count × char[16]`, the names of the
 objects DP sections 40–47 move; exported as `prop_groups`). From 0x24, one
 12-byte record per shot: `u32 mask` (bit 0 = camera, bit *n* = actor slot
-*n*), `u8 extra mask` (bit 0 = DP section 32 props), `u8 prop-group mask`,
-`u16 0`, `u16 start, u16 end` (frames).
+*n*), `u8 door mask` (bit *k* = DP section 32 + *k* turns room door *k*),
+`u8 prop-group mask` (bit *k* = DP section 40 + *k*), `u16 0`, `u16 start,
+u16 end` (frames).
 
 ### Animation data (DP)
 
 48 section offsets. Section 0 is the camera (`type, frames, data offset, 0`,
 then per frame: position, target, field of view in radians, roll). Sections
 1–31 are the actors' animations, one motion bank each (the slot number is
-the section number). Sections 32 and 40–47 are named prop tracks: `count`,
-28-byte descriptors (frames, type 2, data offset, `name[16]`), then 24-byte
-samples (Euler + translation), or 12-byte Euler samples in section 32. All
-831 DH/DP pairs agree on frame counts and actors.
+the section number). Sections 32–39 and 40–47 hold named tracks: `count`,
+28-byte descriptors (frames, type 2, data offset, `name[16]`), then per
+frame 12-byte samples (sections 32–39) or 24-byte samples (Euler +
+translation, sections 40–47). All 831 DH/DP pairs agree on frame counts and
+actors.
+
+**Doors (sections 32–39).** In a shot whose door mask has bit *k*, the game
+turns room door *k* every frame to the second float of the section's sample
+(its heading in radians; the director's `Doors_TurnTo`, `0x221A90`). The
+heading replaces the door's placement angle and stays after the shot. The
+track's name (`null5`, `doornull0`, …) plays no part. Only section 32 is
+used, in 17 shots of EV0008, EV0014, DE0041 and DE0042. Exported as rotation
+keys on a stand-in named like the room's door node (`ST_011_door0`).
 
 **Actor slots** (from the game's actor table): 1 the player (her current
 outfit), 2 Hewie, 3 DB0, 4 DNL, 5 RCG, 6 LRM, 7 LRY, 8 LRO, 9 LRF, 10 GLM,
@@ -593,9 +727,18 @@ Before her change of clothes the player is a separate class whose model is
 `O_FIS/FIS_000.PCK`: EV0002 and the first shots of EV0003 show FIS, and
 EV0003 continues with slots 12 (FIW_200) and 11 (FIN_200).
 
-Props whose names match one of the room's named objects animate that
-object (exported under the room stand-in with the room object's name); the
-others are exported as `prop_<name>` empties.
+**Props (sections 40–47).** Props whose names match one of the room's
+named objects animate that object (exported under the room stand-in with
+the room object's name); the others are exported as `prop_<name>` empties.
+At the start of every shot the game also sets the objects' visibility
+(`Cutscene_StartShot`, `0x2CC130`): the objects listed in a prop group are
+shown in the shots whose prop-group mask has that group, and hidden in the
+other shots if the cutscene uses that group at all. Some of these objects
+are doors of their own (`ev_door`, `ev_door_a` / `ev_ddor_b`,
+`demo_door0`–`2`) standing in a gameplay door's doorway (EV0004, EV0011,
+EV0027, EV0028); the export hides the gameplay door in the shots that show
+its event door, else the closed gameplay door covers the swinging one. The export keys this as
+scale (0 = hidden) on the room-object stand-ins (379 objects in 76 events).
 
 ### Which room a cutscene plays in
 
@@ -634,14 +777,40 @@ bytes padding, 32 bytes data`, applied at the start of the shot (code
 * **Type 0, character lighting** (700 records): room light colours are
   scaled by `+24`, the ambient colour `+20` is added, and up to two
   directional lights (colours `+16` and `+36`, angles `+28, +32` and
-  `+40, +44`) replace room light slots 2 and 1. A light's direction is the
+  `+40, +44`) replace room light slots 2 and 1. A light shines along the
   camera's view direction turned by the first angle about the camera's
-  horizontal axis and by the second about the world's up axis. The Blender
-  script applies this.
+  horizontal axis (positive: down, the light comes from above) and by the
+  second about the up axis (positive: to the right, the light comes from
+  the left); checked against single-light captures, see VERIFICATION. The
+  Blender script applies this.
 * **Type 1, depth effect** (62 records): four distances, probably
   depth-of-field ranges.
-* **Type 2, fog** (285 records): two colours, start and end distance, and
-  some unexplained values.
+* **Type 2, fog** (285 records): two colours, start and end distance
+  (`+0`, `+4`, `+8`, `+12`), a layer word (`+16`) and six bytes that switch
+  a light group on characters (not part of the fog). The record replaces the
+  current fog (at first the room's) until the next one.
+
+### Fog
+
+The game draws fog as one pass over the finished picture (code
+`0x2BB3E0`): it reads the depth buffer as an 8-bit image through a
+256-colour palette and lays the result over the picture. The palette
+(`Renderer_BuildPalette` with generator 2, `Palette_Colour` `0x1B8910`) runs
+from the far colour at entry 0 to the near colour at entry 255, and **halves
+the alpha** (with 128 = fully covered, the fog covers at most half). The
+depth buffer holds a value linear in 1 / distance (`Camera_ZValue`
+`0x121C50`), mapped so the ramp spans the fog's start and end distances. So
+for a pixel at distance *d*, with *t* = (1/start − 1/*d*) / (1/start −
+1/end), limited to 0–1 (the near colour in front of the start: measured on
+DE000C 499, where Fiona is 1 m from the camera and the fog starts at
+1.1 m), the colour is the
+near colour blended towards the far colour by *t* and covers alpha / 256 of
+the picture, in display values; the far colour where nothing was drawn. A
+non-zero layer word draws the fog in layer 9, before the characters (layer
+10), so they stay clear; with 0 it is drawn last, over everything. The
+Blender assembly script rebuilds this in the compositor. (The native port
+draws the ramp linearly in distance and at full alpha, which makes it much
+too strong; checked against the video capture of EV0004.)
 
 ### Movie and soundtrack (SFD)
 

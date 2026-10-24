@@ -5,8 +5,8 @@ DH::
     u16 total_frames, u16 cut_count, 8 x u32 prop-group name lists (0 =
     none; group i = the objects animated by DP slot 40+i: u32 count, count x
     char[16]), cuts at 0x24, 12 bytes each:
-    u32 mask (bit 0 camera, bit n actor slot n), u8 aux mask (bit 0 = DP
-    slot 32 prop tracks), u8 prop-group mask (bit i -> DP slot 40+i),
+    u32 mask (bit 0 camera, bit n actor slot n), u8 door mask (bit k: DP
+    slot 32+k turns room door k), u8 prop-group mask (bit i -> DP slot 40+i),
     u16 0 (padding in every cut), u16 start, u16 end
 
 DP: 48 u32 section offsets at 0. Slot 0 is the camera bank

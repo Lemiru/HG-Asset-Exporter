@@ -11,6 +11,7 @@ from ..formats.stage import DrawRecord, Stage, parse_door_motion, parse_stage
 from ..gltf.builder import GltfBuilder
 from ..util.mathutil import euler_to_quat, look_at_quat, make_continuous
 from .alpha import assign_modes
+from .look import LOOK_NOTE, engine_looks, room_variants
 from .meshutil import VertexWelder
 from .textures import MaterialFactory, TextureSet
 
@@ -31,6 +32,7 @@ class StageOptions:
     cameras: bool = True           # gameplay camera rails (slot 6) as animated cameras
     navmesh: bool = False          # walkable-floor navigation mesh as an extra node
     lights: bool = True            # slot-4 character lights as KHR_lights_punctual nodes
+    emissive_glow: float = 0.0     # > 0: glow geometry (lamps; export/look.py) emissive at this strength
     updates_per_second: float = 30.0
 
 
@@ -56,8 +58,10 @@ def _srgb_to_linear(c: float) -> float:
 
 # PS2 vertex colour 0x80 = 1.0 (texture modulate is (tex * vc) >> 7), applied
 # in gamma space; glTF COLOR_0 is linear and multiplies the base colour.
+# Untextured triangles show the vertex colour itself (0-255).
 _RGB_LUT = [round(_srgb_to_linear(min(1.0, v / 128.0)) * 255) for v in range(256)]
 _A_LUT = [min(255, v * 2) for v in range(256)]
+_RGB_DIRECT = [round(_srgb_to_linear(v / 255.0) * 255) for v in range(256)]
 
 
 class _Prim:
@@ -121,6 +125,7 @@ class StageBuilder:
         for i, t in enumerate(strip_triangles(rec.restart)):
             tris_by_mode.setdefault(modes if isinstance(modes, str) else modes[i], []).append(t)
         count = 0
+        rgb, alpha = (_RGB_LUT, _A_LUT) if rec.material >= 0 else (_RGB_DIRECT, range(256))
         for m, tris in tris_by_mode.items():
             prim = prims.setdefault((rec.material, m, repeat), _Prim())
             prim.sources.append(label)
@@ -132,7 +137,7 @@ class StageBuilder:
                         p = positions[v]
                         r, g, b_, a = rec.colors[v]
                         row = ((p[0] * s, p[1] * s, p[2] * s), rec.uvs[v],
-                               (_RGB_LUT[r], _RGB_LUT[g], _RGB_LUT[b_], _A_LUT[a]))
+                               (rgb[r], rgb[g], rgb[b_], alpha[a]))
                         key = row if shape_delta is None else (row, shape_delta[v])
                         before = len(prim.welder.rows)
                         idx = prim.welder.add(key, row)
@@ -145,7 +150,9 @@ class StageBuilder:
                     count += 1
         return count
 
-    def _mesh(self, name: str, prims: dict, extras: dict | None = None) -> int | None:
+    def _mesh(self, name: str, prims: dict, extras: dict | None = None, glow: bool = False) -> int | None:
+        """``glow``: the room's glow geometry (export/look.py), on its own
+        materials (emissive with ``emissive_glow``)."""
         b = self.b
         primitives = []
         has_targets = any(p.targets for p in prims.values())
@@ -160,8 +167,14 @@ class StageBuilder:
             mat_name = None
             if repeat and 0 <= tex < len(self.stage.textures):
                 mat_name = f"{self.stage.name}_m{tex:03d}_{mode.lower()}_tiled"
+            if glow:
+                mat_name = (mat_name or (f"{self.stage.name}_m{tex:03d}_{mode.lower()}" if tex >= 0
+                                         else f"{self.stage.name}_untextured")) + "_glow"
+            material = self.factory.material(tex, mode, repeat=repeat, name=mat_name)
+            if glow:
+                self._glow_material(material, tex, [r[2] for r in rows])
             out = {"attributes": attrs, "indices": b.indices([i for t in prim.tris for i in t]),
-                   "material": self.factory.material(tex, mode, repeat=repeat, name=mat_name), "mode": 4}
+                   "material": material, "mode": 4}
             if has_targets:
                 delta = prim.targets.get(0) or [(0.0, 0.0, 0.0)] * len(rows)
                 out["targets"] = [{"POSITION": b.positions(delta)}]
@@ -177,6 +190,23 @@ class StageBuilder:
             mesh["extras"] = {**mesh.get("extras", {}), **extras}
         return b.mesh(mesh)
 
+    def _glow_material(self, index: int, tex: int, colors: list) -> None:
+        mat = self.b.doc["materials"][index]
+        mat.setdefault("extras", {})["glow"] = True
+        strength = self.opts.emissive_glow
+        if strength <= 0 or "emissiveFactor" in mat:
+            return
+        # emission = the texture x the mean vertex colour (glTF emission has no vertex colours)
+        n = max(1, len(colors))
+        mat["emissiveFactor"] = [round(sum(c[k] for c in colors) / n / 255.0, 4) for k in range(3)]
+        base = mat.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+        if base is not None and tex >= 0:
+            mat["emissiveTexture"] = dict(base)
+        ext = mat.setdefault("extensions", {})
+        ext.pop("KHR_materials_unlit", None)          # unlit materials ignore emission
+        ext["KHR_materials_emissive_strength"] = {"emissiveStrength": strength}
+        self.b.extensions_used.add("KHR_materials_emissive_strength")
+
     # ---------------------------------------------------------------- building
     def build(self, parent: int | None = None) -> GltfBuilder:
         st, b, s = self.stage, self.b, self.opts.scale
@@ -185,15 +215,19 @@ class StageBuilder:
             extras["character_lighting"] = {
                 "ambient_rgb": [round(c, 4) for c in st.lighting.ambient], "note": LIGHTING_NOTE}
         if st.effects:
-            extras["room_effects"] = st.effects
+            extras["room_effects"] = dict(st.effects)
+            variants = room_variants(st.name)
+            if variants:
+                extras["room_effects"]["script_variants"] = variants
+            extras["room_effects"]["engine_look"] = engine_looks(st.effects, variants)
             extras["room_effects_note"] = ("PAC slot 13 screen effects: fog (RGBA colours, start/end distance in "
-                                           "game units), depth effect (four distances), colour filter/effect "
-                                           "colours (128 = neutral)")
+                                           "game units), depth effect (four distances). " + LOOK_NOTE)
         root = b.node({"name": st.name, "extras": extras}, root=parent is None)
         if parent is not None:
             b.add_child(parent, root)
         self.root = root
         self.object_nodes: dict[str, int] = {}
+        self.door_nodes: dict[int, int] = {}      # door index (PAC slot 7/8) -> node
         buckets: dict[tuple[str, int], dict] = {}
         for g, records in sorted(st.groups.items()):
             if g == 5 and not self.opts.effects:
@@ -204,7 +238,7 @@ class StageBuilder:
                 blend = True if g == 5 else rec.blend
                 if g == 4 and self.opts.animations and self._atlas(root, rec, i):
                     continue
-                kind = {4: "animated", 5: "effects"}.get(g, "main")
+                kind = {2: "glow", 4: "animated", 5: "effects"}.get(g, "main")
                 if kind == "main" and blend and self.is_shadow_texture(rec.material):
                     kind = "shadows"
                 # Shadows and effects (some additive) stay blended as drawn.
@@ -216,7 +250,10 @@ class StageBuilder:
             extras = {"visibility_selector": sel, "kind": kind}
             if kind == "effects":
                 extras["note"] = "PS2 draws these without depth writes; some use additive blending"
-            mesh = self._mesh(name, prims, extras)
+            if kind == "glow":
+                extras["note"] = ("lamps and lights: drawn after the tint and fog and marking the bloom "
+                                  "(export/look.py)")
+            mesh = self._mesh(name, prims, extras, glow=kind == "glow")
             if mesh is not None:
                 b.add_child(root, b.node({"name": name, "mesh": mesh, "extras": extras}))
                 self.report["nodes"].append(name)
@@ -237,6 +274,7 @@ class StageBuilder:
                     node["rotation"] = list(euler_to_quat(*door.euler))
                 index = b.node(node)
                 b.add_child(root, index)
+                self.door_nodes[door.index] = index
                 self.report["nodes"].append(name)
                 if self.opts.animations and door.euler is not None and door.resource_id not in (None, -1):
                     self._door_clips(index, name, door.euler)
@@ -251,12 +289,14 @@ class StageBuilder:
                         delta = None
                 self._add_record(prims, rec, rec.positions, self._modes(rec, obj.blend), obj.name, delta)
                 name = f"{st.name}_obj{obj.index:03d}_{obj.name or 'unnamed'}"
-                mesh = self._mesh(name, prims, {"category": obj.category})
+                glow = obj.name.lower().startswith("g_")       # drawn in the glow layer (export/look.py)
+                mesh = self._mesh(name, prims, {"category": obj.category}, glow=glow)
                 if mesh is None:
                     continue
                 node = {"name": name, "mesh": mesh, "translation": [c * s for c in obj.translation],
                         "rotation": list(euler_to_quat(*obj.euler)),
-                        "extras": {"object_index": obj.index, "object_name": obj.name, "category": obj.category}}
+                        "extras": {"object_index": obj.index, "object_name": obj.name, "category": obj.category,
+                                   **({"kind": "glow"} if glow else {})}}
                 index = b.node(node)
                 b.add_child(root, index)
                 self.object_nodes.setdefault(obj.name, index)
@@ -523,7 +563,8 @@ LIGHTING_NOTE = ("PAC slot 4 character lighting (the room itself is pre-lit in i
                  "directional lights have no falloff. Colours are on the game's 0-255 scale (game_rgb extras) and "
                  "scaled by game_intensity; glTF intensities assume 128 = 2000 lux: directional = that illuminance, point lights match "
                  "the game's strength at half their range (at most 2.5 m) (glTF falls off with the inverse square, the "
-                 "game linearly). Scale to taste.")
+                 "game linearly). The game multiplies the texture's display value by (ambient + lights) / 128, "
+                 "so linear-light materials look brighter than the game in dim rooms; scale to taste.")
 LUX_PER_UNIT = 2000.0 / 128.0
 MATCH_DISTANCE = 2.5      # metres: where point-light intensity matches the game's falloff
 
