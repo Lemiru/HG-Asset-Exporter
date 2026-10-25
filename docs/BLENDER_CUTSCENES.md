@@ -265,11 +265,17 @@ back at the end.
 
 These effects only show in renders and in the viewport's compositor preview.
 
-**The movie layer.** The movie is put on a plane just in front of the
-camera that fills the frame. If it holds full-screen pre-rendered shots, the
-plane is opaque and shown only during those shots; if it holds effects, it
-is added over the picture throughout (its black adds nothing). A movie strip
-in Blender's sequencer would replace the render, so it is not used.
+**The movie layer.** The game draws the event movie over the finished
+picture, after the tint, fog and bloom, stretched over the whole frame; the
+script does the same in the compositor (the *effect_movie* image node).
+Full-screen pre-rendered shots replace the picture during their cuts.
+Effect movies (lens flares, smoke, sparkles) are blended in with an alpha
+the game takes from each pixel's brightness with the event's luminance key
+(`alpha_key` in the movie extras): pixels darker than its low value leave
+the picture as it is, brighter than its high value cover it. So the dim
+parts barely show: DE000C's lens flare is a faint haze with a brighter
+core, not the full movie. A movie strip in
+Blender's sequencer would replace the render, so it is not used.
 
 **Cloth and hair physics.** The game does not animate cloth, hair or chests
 with keyframes; it simulates them while the game runs (see

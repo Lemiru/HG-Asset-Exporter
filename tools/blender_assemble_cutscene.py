@@ -59,9 +59,10 @@ Options after ``--``:
                         frames (whether story playback fades too is unverified)
     --start-fade        add the movie gallery's fade in from black over an event's first
                         17 frames
-    --no-movie          leave out the event movie. By default it is placed on a plane in
-                        front of the camera: full-screen pre-rendered inserts replace the
-                        view during their cuts, effect movies are added over the view
+    --no-movie          leave out the event movie. By default the compositor draws it as
+                        the game does, after the screen effects: pre-rendered inserts
+                        replace the view during their cuts, effect movies are blended
+                        in with an alpha taken from their brightness
     --render-space S    display (default): render in display values like the PS2 - raw
                         textures, vertex colours interpolated and multiplied in display
                         values, translucent layers blended in them, GS rounding - shown
@@ -907,16 +908,34 @@ FADE_FRAMES = 16                    # the gallery's end fade: 1/16 darker per fr
 
 
 def apply_frame_overlays(scene, cut_json: dict, report: list, letterbox: bool = True, end_fade: bool = False,
-                         display: bool = False, start_fade: bool = False) -> None:
-    """What the game lays over the finished picture last: the cutscene
+                         display: bool = False, start_fade: bool = False, movie: Path | None = None) -> None:
+    """What the game lays over the finished picture last: the event movie,
+    the cutscene
     letterbox (black bars over the top and bottom eighth of the 4:3 frame,
     in every event) and, optionally, the movie gallery's fade to black at
     the end of an event (measured on DE000C and EV0019 while playing: from
     14 frames before the end the picture is multiplied by (frames + 2 -
     frame) / 16 in display values; the event ends at 3/16, and the gallery
     cuts to black), and the fade in from black at its start (black up to
-    frame 1, then (frame - 1) / 16)."""
-    if not (letterbox or end_fade or start_fade):
+    frame 1, then (frame - 1) / 16).
+
+    The movie is drawn in renderer layer 0x2B, after the tint, fog and
+    bloom: the decoded frame (the export's movie frame for the same event
+    frame) stretched over the whole picture. ``inserts`` movies (512 x 224
+    pre-rendered shots) replace the picture during their insert cuts.
+    ``overlay`` movies (256 x 224 effects such as DE000C's lens flare) are
+    alpha-blended with an alpha the movie player takes from each pixel's
+    luma with the event's key (the movie extras' alpha_key, low and high):
+    (Y - low) / (high - low) limited to 0-1, Y = 16 + 219 x (0.299 R +
+    0.587 G + 0.114 B); so dim glows and rays barely show and only bright
+    parts cover the picture (checked against the frames in the game's
+    memory in DE000C and EV0014, error 0.3 of 128)."""
+    info = next((n["extras"]["movie"] for n in cut_json.get("nodes", [])
+                 if "movie" in n.get("extras", {})), None)
+    mode = info.get("mode") if info and movie is not None and movie.is_file() else None
+    if mode == "inserts" and not info.get("insert_cuts"):
+        mode = None
+    if not (letterbox or end_fade or start_fade or mode):
         return
     ng = scene.compositing_node_group
     if ng is None:                                  # no screen effects: start from the render
@@ -930,6 +949,41 @@ def apply_frame_overlays(scene, cut_json: dict, report: list, letterbox: bool = 
     C = _Comp(ng)
     out = next(n for n in ng.nodes if n.type == "GROUP_OUTPUT")
     image = out.inputs[0].links[0].from_socket
+    if mode:
+        clip = bpy.data.images.load(str(movie), check_existing=True)
+        clip.source = "MOVIE"
+        clip.colorspace_settings.name = "Non-Color"    # the decoded bytes are the game's display values
+        node = C.node("CompositorNodeImage", "effect_movie")
+        node.image = clip
+        node.frame_duration = clip.frame_duration
+        node.frame_start = 0                            # scene frame 0 = first movie frame
+        node.frame_offset = 0
+        scale = C.node("CompositorNodeScale", inputs={"Type": "Render Size", "Frame Type": "Stretch"})
+        C.put(scale.inputs[0], node.outputs["Image"])
+        colour = scale.outputs[0]
+        if mode == "overlay":
+            sep = C.node("CompositorNodeSeparateColor")
+            C.put(sep.inputs[0], colour)
+            luma = C.math("ADD", C.math("ADD", C.math("MULTIPLY", sep.outputs[0], 0.299),
+                                        C.math("MULTIPLY", sep.outputs[1], 0.587)),
+                          C.math("MULTIPLY", sep.outputs[2], 0.114))
+            low, high = info.get("alpha_key", (16, 32))
+            span = max(high - low, 1)
+            alpha = C.math("ADD", C.math("MULTIPLY", luma, 219.0 / span), (16.0 - low) / span, clamp=True)
+            note = f"overlay, luminance key {low}-{high}"
+        else:                                       # inserts: shown whole during their cuts
+            shown_cuts = set(info["insert_cuts"])
+            on = C.node("ShaderNodeValue", "movie_insert")
+            for c in (cut_json.get("animations") or [{}])[0].get("extras", {}).get("cuts", []):
+                on.outputs[0].default_value = 1.0 if c["cut"] in shown_cuts else 0.0
+                on.outputs[0].keyframe_insert("default_value", frame=c["start_frame"])
+            constant_keys(ng, 'nodes["movie_insert"].outputs[0].default_value')
+            alpha = on.outputs[0]
+            note = f"inserts, cuts {sorted(shown_cuts)}"
+        shown = image if display else C.convert(image, "Linear Rec.709", "sRGB")
+        shown = C.lerp(shown, colour, alpha)
+        image = C.quantize(shown) if display else C.convert(shown, "sRGB", "Linear Rec.709")
+        report.append(f"movie: {movie.name} ({note}, after the screen effects)")
     frames = next((n["extras"]["frames"] for n in cut_json.get("nodes", [])
                    if "frames" in n.get("extras", {})), None)
     keys = []
@@ -1012,82 +1066,6 @@ def match_game_rendering(actor_objs: list, room_objs: list, objs: list, flags: s
         lifted += len(normals)
     if lifted:
         report.append(f"render: {lifted} room decal vertices lifted 1 mm")
-
-
-def add_movie_layer(scene, camera, cut_json: dict, movie: Path, report: list) -> None:
-    """The event movie on a plane just in front of the camera, filling the
-    frame. ``inserts`` movies (full-screen pre-rendered shots) cover the view
-    only during their insert cuts; ``overlay`` movies (effects on black) are
-    added on top of the 3D view all the time."""
-    info = next((n["extras"]["movie"] for n in cut_json.get("nodes", [])
-                 if "movie" in n.get("extras", {})), None)
-    if info is None or not movie.is_file():
-        return
-    anim = (cut_json.get("animations") or [{}])[0].get("extras", {})
-    cuts = anim.get("cuts", [])
-    inserts = info["mode"] == "inserts"
-    if inserts and not info.get("insert_cuts"):
-        return
-    image = bpy.data.images.load(str(movie), check_existing=True)
-    image.source = "MOVIE"
-    mat = bpy.data.materials.new(f"{movie.stem}_movie")
-    mat.use_nodes = True
-    nt = mat.node_tree
-    nt.nodes.clear()
-    tex = nt.nodes.new("ShaderNodeTexImage")
-    tex.image = image
-    tex.image_user.frame_duration = image.frame_duration
-    tex.image_user.frame_start = 0            # scene frame 0 = first movie frame
-    tex.image_user.use_auto_refresh = True
-    emit = nt.nodes.new("ShaderNodeEmission")
-    nt.links.new(tex.outputs["Color"], emit.inputs["Color"])
-    out = nt.nodes.new("ShaderNodeOutputMaterial")
-    if inserts:
-        nt.links.new(emit.outputs[0], out.inputs["Surface"])
-    else:                                      # additive: black adds nothing
-        add = nt.nodes.new("ShaderNodeAddShader")
-        nt.links.new(nt.nodes.new("ShaderNodeBsdfTransparent").outputs[0], add.inputs[0])
-        nt.links.new(emit.outputs[0], add.inputs[1])
-        nt.links.new(add.outputs[0], out.inputs["Surface"])
-        if hasattr(mat, "surface_render_method"):
-            mat.surface_render_method = "BLENDED"
-    # plane at the frame's corners, just past the near clip plane
-    depth = camera.data.clip_start * 1.05
-
-    def corners():
-        return [v / -v.z for v in camera.data.view_frame(scene=scene)]
-
-    scene.frame_set(0)
-    base = corners()
-    mesh = bpy.data.meshes.new(f"{movie.stem}_movie")
-    mesh.from_pydata([(v.x * depth, v.y * depth, 0.0) for v in base], [], [(0, 1, 2, 3)])
-    uv = mesh.uv_layers.new()
-    for loop in mesh.loops:                    # view_frame order: top right, bottom right, bottom left, top left
-        uv.data[loop.index].uv = ((1, 1), (1, 0), (0, 0), (0, 1))[loop.vertex_index]
-    mesh.materials.append(mat)
-    plane = bpy.data.objects.new(f"{movie.stem}_movie", mesh)
-    scene.collection.objects.link(plane)
-    plane.parent = camera
-    plane.location = (0.0, 0.0, -depth)
-    for attr in ("visible_diffuse", "visible_glossy", "visible_transmission", "visible_volume_scatter",
-                 "visible_shadow"):
-        if hasattr(plane, attr):
-            setattr(plane, attr, False)       # seen by the camera only, lights nothing
-    width0 = base[0].x
-    shown = set(info.get("insert_cuts", []))
-    for c in cuts:                             # the frame size follows each cut's field of view
-        scene.frame_set(c["start_frame"])
-        r = corners()[0].x / width0
-        plane.scale = (r, r, 1.0)
-        plane.keyframe_insert("scale", frame=c["start_frame"])
-        if inserts:
-            plane.hide_render = plane.hide_viewport = c["cut"] not in shown
-            plane.keyframe_insert("hide_render", frame=c["start_frame"])
-            plane.keyframe_insert("hide_viewport", frame=c["start_frame"])
-    for path in ("scale", "hide_render", "hide_viewport"):
-        constant_keys(plane, path)
-    report.append(f"movie: {movie.name} ({info['mode']}"
-                  + (f", insert cuts {sorted(shown)})" if inserts else ")"))
 
 
 # --------------------------------------------------------------- secondary motion
@@ -2289,7 +2267,8 @@ def main(argv: list[str], from_cli: bool) -> None:
                          display=DISPLAY_SPACE)
     apply_frame_overlays(scene, read_gltf_json(cutscene), report, letterbox="--no-letterbox" not in flags,
                          end_fade="--end-fade" in flags, display=DISPLAY_SPACE,
-                         start_fade="--start-fade" in flags)
+                         start_fade="--start-fade" in flags,
+                         movie=None if "--no-movie" in flags else cutscene.with_suffix(".mp4"))
 
     # 6. match the game's rendering: no light shadows, depth-sorted translucency,
     #    colours shown as stored (the game has no tone mapping)
@@ -2297,10 +2276,7 @@ def main(argv: list[str], from_cli: bool) -> None:
     scene.view_settings.view_transform = opts["--view-transform"] or ("Raw" if DISPLAY_SPACE else "Standard")
     scene.view_settings.look = "None"
 
-    # 7. the event movie: pre-rendered inserts or effect overlays
-    movie = cutscene.with_suffix(".mp4")
-    if "--no-movie" not in flags:
-        add_movie_layer(scene, camera, read_gltf_json(cutscene), movie, report)
+    # 7. (the event movie is blended in by the compositor, see apply_frame_overlays)
     if DISPLAY_SPACE:                # after every material exists (the movie's too)
         apply_display_space(scene, report)
 

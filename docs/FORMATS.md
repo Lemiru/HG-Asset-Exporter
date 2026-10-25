@@ -823,8 +823,25 @@ content. There are two kinds:
   exactly with shots that have only a camera and no actors or props; the
   game shows the film instead of the 3D view there.
 * **Overlays** (256×224, all other events): effects drawn over black
-  (smoke, glass sparkles, fire, lightning, X-ray views), laid over the 3D
-  view.
+  (smoke, glass sparkles, fire, lightning, X-ray views, lens flares).
+
+The game decodes a frame per event frame and draws it in renderer layer
+0x2B, after the tint, fog and bloom: 16-pixel strips are uploaded to the
+GS (at block 0x3000) and drawn as one sprite over the whole 512×448 frame.
+An insert is drawn opaque (blending off). An overlay is alpha-blended,
+(movie − picture) × A / 128 + picture, with an alpha the movie player
+writes per pixel from the decoded luma Y (16–235) and the event's
+luminance key (low, high): A = 128 × (Y − low) / (high − low), limited to
+0–128 (error 0.3 against the frames in the game's memory in DE000C and
+EV0014). Black and dim parts leave the picture as it is. The key sits in
+the player's settings (`0x3EA1E4`; the library's default is 31–100), is
+fixed for an event, and differs between events: 16–32 for most, 16–255 for
+twelve, single values such as 40–200 (DE000C) or 50–255 (EV0014). Where the
+game takes it from was not found (not the event's files, the SFD or a table
+in the program), so the exporter carries the keys read from the game for
+the 109 events in the movie gallery (`MOVIE_ALPHA_KEYS`; variants not in
+the gallery take their base event's) as `alpha_key` in the movie extras.
+The exported MP4 decodes to the same colours (mean difference 0.3).
 
 Exported as a lossless WAV (the soundtrack) and a video-only MP4, described
 by `movie` in the cutscene's extras: `mode` (`inserts` or `overlay`),

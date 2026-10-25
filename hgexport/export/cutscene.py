@@ -234,13 +234,55 @@ def movie_content(sfd: Path) -> list[list[int]]:
     return spans
 
 
+# The movie player's luminance key per event: an overlay movie's pixel covers
+# the picture by (Y - low) / (high - low), limited to 0-1, Y being the
+# decoder's luma (16-235). Read from the player's settings (0x3EA1E4) while
+# each event played in PCSX2's movie gallery; where the game sets it was not
+# found (not in the event's files, the SFD or a table in the program).
+MOVIE_ALPHA_KEYS = {
+    "DE0000": (16, 32), "DE0001": (15, 60), "DE0002": (15, 150), "DE0003": (40, 255), "DE0004": (16, 32), "DE0005": (18, 30),
+    "DE0006": (30, 200), "DE0007": (16, 32), "DE0008": (16, 255), "DE0009": (40, 180), "DE000A": (40, 255), "DE000B": (16, 255),
+    "DE000C": (40, 200), "DE000D": (16, 32), "DE000E": (31, 100), "DE000F": (16, 32), "DE0010": (31, 100), "DE0011": (16, 32),
+    "DE0012": (80, 255), "DE0013": (16, 32), "DE0014": (31, 100), "DE0015": (30, 200), "DE0016": (16, 32), "DE0017": (16, 40),
+    "DE0018": (16, 32), "DE0019": (16, 32), "DE001A": (30, 200), "DE001B": (31, 100), "DE001C": (16, 32), "DE001D": (16, 32),
+    "DE001E": (20, 200), "DE001F": (16, 32), "DE0020": (16, 40), "DE0021": (16, 80), "DE0022": (16, 32), "DE0023": (16, 255),
+    "DE0024": (16, 32), "DE0025": (20, 120), "DE0026": (40, 120), "DE0027": (16, 32), "DE0028": (16, 32), "DE0029": (16, 255),
+    "DE002A": (16, 32), "DE002B": (16, 32), "DE002C": (31, 100), "DE002D": (90, 255), "DE002E": (16, 32), "DE002F": (16, 200),
+    "DE0030": (16, 200), "DE0031": (16, 255), "DE0032": (16, 32), "DE0033": (16, 255), "DE0034": (16, 255), "DE0036": (16, 32),
+    "DE0039": (16, 255), "DE003B": (16, 80), "DE003C": (16, 32), "DE003D": (16, 32), "DE003F": (16, 32), "DE0040": (16, 32),
+    "DE0041": (16, 32), "DE0042": (16, 32), "DE0043": (16, 255), "DE0044": (16, 32), "DE0045": (16, 32), "DE0046": (100, 255),
+    "DE0047": (20, 100), "DE0048": (16, 200), "DE0049": (16, 200), "DE1018": (16, 32), "DE101F": (16, 32), "DE102E": (16, 32),
+    "DE1033": (16, 255), "DE1034": (16, 255), "DE2018": (16, 32), "DE201F": (16, 120), "EV0002": (31, 100), "EV0003": (16, 32),
+    "EV0004": (31, 100), "EV0005": (31, 100), "EV0006": (16, 32), "EV0007": (16, 32), "EV0008": (31, 100), "EV0009": (16, 32),
+    "EV0010": (16, 32), "EV0011": (16, 32), "EV0012": (16, 32), "EV0013": (16, 32), "EV0014": (50, 255), "EV0015": (16, 32),
+    "EV0016": (16, 32), "EV0017": (16, 32), "EV0018": (30, 200), "EV0019": (16, 32), "EV0020": (16, 32), "EV0021": (31, 100),
+    "EV0022": (16, 32), "EV0023": (16, 32), "EV0024": (16, 32), "EV0025": (16, 32), "EV0026": (45, 65), "EV0027": (16, 32),
+    "EV0028": (16, 32), "EV0029": (16, 255), "EV0030": (16, 32), "EV0031": (16, 32), "EV0032": (16, 32), "EV0033": (16, 32),
+    "EV0034": (16, 32),
+}
+MOVIE_KEY_DEFAULT = (16, 32)        # what most events use
+
+
+def movie_alpha_key(event: str) -> tuple[list[int], str]:
+    """The event's movie key and where it comes from: measured, the base
+    event's for variants not in the gallery (DE100B -> DE000B), or assumed."""
+    name = event.upper()
+    if name in MOVIE_ALPHA_KEYS:
+        return list(MOVIE_ALPHA_KEYS[name]), "measured in the game"
+    base = name[:2] + "0" + name[3:]
+    if base in MOVIE_ALPHA_KEYS:
+        return list(MOVIE_ALPHA_KEYS[base]), f"from {base} (not in the movie gallery)"
+    return list(MOVIE_KEY_DEFAULT), "assumed (not in the movie gallery)"
+
+
 def event_movie(event_dir: Path, timeline: EventTimeline) -> dict | None:
     """The event SFD plays for the whole cutscene, black except where it has
     content. 512-pixel-wide SFDs (EV0002/4/5/8/21) hold full-screen
     pre-rendered inserts on camera-only cuts, shown instead of the 3D view
     (EV0002 cut 20 in the game shows only the insert, although the cut's
     camera faces a lit portrait). 256-wide SFDs hold effects (smoke,
-    sparkles, fire, ...) drawn over black, laid over the 3D view."""
+    sparkles, fire, lens flares, ...) drawn over black, which the game blends
+    over the finished picture with an alpha taken from their brightness."""
     sfd = next(iter(sorted(event_dir.glob("*.SFD"))), None)
     if sfd is None:
         return None
@@ -250,12 +292,17 @@ def event_movie(event_dir: Path, timeline: EventTimeline) -> dict | None:
         out["mode"] = "inserts"
         out["insert_cuts"] = [c.index for c in timeline.cuts if c.mask == 1 and not c.aux_mask and not c.prop_mask
                               and any(a <= c.end and b >= c.start for a, b in content)]
-        out["note"] = ("full-screen pre-rendered inserts: the movie replaces the 3D view during insert_cuts; "
+        out["note"] = ("full-screen pre-rendered inserts: the movie replaces the finished picture (after the "
+                       "screen effects) during insert_cuts; "
                        "content_frames = [[first, last event frame], ...] where the movie is not black")
     else:
         out["mode"] = "overlay"
-        out["note"] = ("effects drawn over black: add the movie over the 3D view; content_frames = "
-                       "[[first, last event frame], ...] where it is not black")
+        out["alpha_key"], out["alpha_key_source"] = movie_alpha_key(timeline.name)
+        out["note"] = ("effects drawn over black: the game blends each frame over the finished picture "
+                       "(after the screen effects), stretched to the whole frame, in display values, with "
+                       "alpha = (Y - alpha_key[0]) / (alpha_key[1] - alpha_key[0]) limited to 0-1, Y = 16 + "
+                       "219 * (0.299 R + 0.587 G + 0.114 B) with R, G, B on 0-1; content_frames = [[first, "
+                       "last event frame], ...] where it is not black")
     return out
 def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions | None = None) -> dict:
     opts = opts or CutsceneOptions()

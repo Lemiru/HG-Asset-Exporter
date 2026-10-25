@@ -102,8 +102,8 @@ match. Differences found on the way, and fixed:
   *Dithered* transparency mode);
 * hard shadows from hair across faces (the game's lights cast no shadows, so
   they are switched off);
-* pre-rendered movie shots missing (the movie layer is now placed in front
-  of the camera);
+* pre-rendered movie shots missing (the movie is now drawn over the
+  picture);
 * EV0014's tablecloth rendering black in EEVEE (soft shadow decals lying
   exactly on the cloth; rooms now keep *Blended* and the decals are lifted
   1 mm);
@@ -238,6 +238,31 @@ frame f is (frames + 2 − f) / 16 of its brightness from 14 frames before the
 end; `--end-fade` reproduces it within 0.3 % on DE000C 776–792. Whether the
 story plays it too was not checked.
 
+### Event movies
+
+A blind comparison of a PCSX2 recording of DE000C and the Blender assembly
+showed the game's lens flare (the event's overlay movie) far fainter than
+the movie itself. With the event held over PINE, the movie still plays,
+and the difference between grabs shows the flare where the full-frame movie
+puts it. The GS packets show how it gets there: the frame is uploaded in
+16-pixel strips and drawn in renderer layer 0x2B, after the tint, fog and
+bloom, as one sprite over the frame, alpha-blended with the alpha the
+decoded frame carries. Read from the game's memory, that alpha follows
+the pixel's luma exactly (error 0.3 of 128), with a threshold and slope
+that differ between events but not within one: they are the movie player's
+luminance key (low, high), 40–200 in DE000C and 50–255 in EV0014, used as
+128 × (Y − low) / (high − low) on the decoded luma Y. Reading the key while
+each of the gallery's events played gave the table the exporter carries.
+The colours match the exported MP4 (mean difference 0.3). With the
+assembly blending the movie that way, DE000C frame 150 (where the
+flare is bright) comes within 0.3–2.2 levels of the game in the flare's
+regions, against 1.5–6.6 without the movie; at frame 60 the flare is too
+faint to change them; in EV0014 (steam over a plate, key 50–255) the
+pixels the movie touches are 10 levels from the game against 14 without
+it (the held game frame runs a few movie frames ahead). EV0005's
+pre-rendered insert is drawn in the same layer with
+blending off, so inserts replace the picture after the screen effects too.
+
 The letterbox bars cover rows 0–95 and 679–774 of the 775-row captured
 picture in every captured frame of the four cutscenes, i.e. 56 of the 448
 lines at each edge; the assembly's bars cover the same eighth.
@@ -266,10 +291,10 @@ foliage, which the old rules drew with dark sorting bands.
   glass in EV0018). They are marked so they can be hidden. In DE000C a glow
   panel in group 27 (`ST_00C_glow_sel027`) covers the stained-glass window
   the game shows.
-* **Effect movies.** The Blender script adds an event's `overlay` movie over
-  the whole view at full strength. In DE000C (a lens flare over the first
-  180 frames) the game shows the flare in the same place but far fainter;
-  how the game blends it in has not been found yet.
+* **Time of day in the movie gallery.** `--time-of-day gallery` assumes the
+  gallery clears the story flags for every event (true for EV0002 and the
+  first area's warm rooms), but the gallery shows EV0014 in room 0x11's
+  night look, which the story uses there.
 * **The first second of a cutscene's physics** depends on the state the
   characters bring from gameplay, which a cutscene file does not contain.
 * **Debilitas' physics** differs by about 1 cm, because the game poses his

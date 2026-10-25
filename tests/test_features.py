@@ -166,7 +166,11 @@ class ModelAndSceneTests(unittest.TestCase):
             self.assertNotIn("prop_doornull0", {n.get("name") for n in nodes})
             story = next(n["extras"]["story_state"] for n in nodes if "story_state" in n.get("extras", {}))
             self.assertEqual(story["story_flags"], [1, 2])          # after the opening: the rooms' night look
+            movie = next(n["extras"]["movie"] for n in nodes if "movie" in n.get("extras", {}))
+            self.assertEqual((movie["mode"], movie["alpha_key"]), ("overlay", [50, 255]))   # steam, read in the game
             self.assertEqual(validate(out), [])
+        from hgexport.export.cutscene import movie_alpha_key
+        self.assertEqual(movie_alpha_key("DE100B"), ([16, 255], "from DE000B (not in the movie gallery)"))
 
     def test_shadow_volumes(self):
         from hgexport.export.character import export_shadow_volumes
