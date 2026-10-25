@@ -20,6 +20,13 @@ from ..formats.stage import parse_navigation, parse_pac
 CELL = 20.0
 _EVENT_ROOMS = Path(__file__).resolve().parent.parent / "data" / "event_rooms.json"
 
+# The room the movie gallery plays an event in, for events the table lists in
+# several rooms (room 0x37's script switches on the gallery entry, command 0x3A).
+GALLERY_ROOMS = {"DE000A": "ST_025", "DE0007": "ST_01C", "DE0017": "ST_01E", "DE0009": "ST_017",
+                 "EV0014": "ST_011", "DE0026": "ST_066", "EV0019": "ST_047", "DE0027": "ST_04A",
+                 "DE002A": "ST_106", "EV0021": "ST_10B", "DE0040": "ST_08A", "DE0042": "ST_085",
+                 "EV0030": "ST_08D", "EV0034": "ST_034"}
+
 
 @lru_cache(maxsize=1)
 def event_rooms() -> dict[str, list[str]]:
@@ -110,10 +117,12 @@ def rooms_for_cuts(data_root: Path, event: str, cuts: list[CutData], palettes: d
     out: list[tuple[Path | None, float, str]] = []
     points = [actor_roots(cut, palettes, roots) for cut in cuts]
     # One room for the whole event when it fits: listed rooms ordered by
-    # aggregate fit over all cuts (stable, so the table order breaks ties).
+    # aggregate fit over all cuts; ties go to the gallery's room, then the
+    # table order (the sort is stable).
     if len(listed) > 1:
         total = {pac: sum(floor_fit(pac, p) * len(p) for p in points) for pac in listed}
-        listed.sort(key=lambda pac: -total[pac])
+        gallery = GALLERY_ROOMS.get(event.upper())
+        listed.sort(key=lambda pac: (-total[pac], pac.stem != gallery))
     for cut, pts in zip(cuts, points):
         if not pts:
             out.append((None, 0.0, "no actors"))

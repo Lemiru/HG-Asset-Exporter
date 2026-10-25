@@ -36,8 +36,9 @@ Options after ``--``:
                         materials with the export's light scale (for Cycles)
     --time-of-day T     which tint the rooms use: story (default: as the cutscene plays
                         in the story; warm only for the opening EV0002 / EV0003),
-                        gallery (as the movie gallery shows it: warm in most early
-                        rooms), warm, night (the rooms' own values)
+                        gallery (as the movie gallery shows it: the rooms' own values
+                        and what the event's replay script sets, warm for eleven early
+                        events), warm, night (the rooms' own values)
     --shadows           keep the lights' shadows (the game casts none from its lights;
                         with them, hair and low-poly edges throw hard shadows on faces)
     --blended           keep the importer's BLENDED render method for the characters'
@@ -59,6 +60,11 @@ Options after ``--``:
                         frames (whether story playback fades too is unverified)
     --start-fade        add the movie gallery's fade in from black over an event's first
                         17 frames
+    --no-reflections    leave out the character reflections (windows, mirrors, floors) the
+                        game draws in some rooms' cutscenes
+    --no-character-shadows
+                        leave out the characters' shadows on the room (the game's stencil
+                        shadows from one room light per character)
     --no-movie          leave out the event movie. By default the compositor draws it as
                         the game does, after the screen effects: pre-rendered inserts
                         replace the view during their cuts, effect movies are blended
@@ -536,17 +542,33 @@ _TAPS2 = ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (2, -2), (-2, 2))
 
 
 def _story_state(cut_json: dict, time_of_day: str):
-    """The story state that picks the rooms' script variants: the cutscene's
-    own (story), none set (gallery: what the movie gallery shows), the warm
-    variants (warm) or the rooms' own values (night: None)."""
+    """The state that picks the rooms' script variants: the cutscene's own in
+    the story (story), the movie gallery's (gallery: the rooms' own values and
+    what the event's replay script sets), the warm variants (warm) or the rooms'
+    own values (night: None)."""
     if time_of_day == "night":
         return None
+    node = next((n for n in cut_json.get("nodes", []) if "story_state" in n.get("extras", {})), None)
+    event = node["name"].upper() if node else None
     if time_of_day == "gallery":
-        return {"story_flags": [], "story_phase": 255}
+        return {"event": event, "gallery": True}
     if time_of_day == "warm":
-        return {"story_flags": [], "story_phase": 1}
-    return next((n["extras"]["story_state"] for n in cut_json.get("nodes", [])
-                 if "story_state" in n.get("extras", {})), None)
+        return {"event": event, "story_flags": [], "story_phase": 1}
+    return {"event": event, **node["extras"]["story_state"]} if node else None
+
+
+def _variant_holds(when: dict, state: dict) -> bool:
+    """export/look.py condition_holds."""
+    event = state.get("event")
+    if state.get("gallery"):
+        return event in when.get("gallery_events", ())
+    if "story_events" in when:
+        return event in when["story_events"]
+    if "story_flag_clear" not in when and "story_phase" not in when:
+        return False
+    if "story_flag_clear" in when and when["story_flag_clear"] in state.get("story_flags", []):
+        return False
+    return "story_phase" not in when or when["story_phase"] == state.get("story_phase")
 
 
 def _room_look(effects: dict, state) -> dict:
@@ -554,12 +576,8 @@ def _room_look(effects: dict, state) -> dict:
     look = {"tint": effects.get("tint"), "bloom": effects.get("bloom"), "variant": "night"}
     if state is None:
         return look
-    flags = set(state.get("story_flags", []))
     for v in effects.get("script_variants", []):
-        when = v.get("when", {})
-        if "story_flag_clear" in when and when["story_flag_clear"] in flags:
-            continue
-        if "story_phase" in when and when["story_phase"] != state.get("story_phase"):
+        if not _variant_holds(v.get("when", {}), state):
             continue
         look.update({k: v[k] for k in ("tint", "bloom") if k in v})
         look["variant"] = v.get("name", "night")
@@ -568,15 +586,410 @@ def _room_look(effects: dict, state) -> dict:
 
 
 def _add_aov(scene, name: str, materials) -> None:
-    vl = scene.view_layers[0]
-    if not any(a.name == name for a in vl.aovs):
-        aov = vl.aovs.add()
-        aov.name, aov.type = name, "VALUE"
+    for vl in scene.view_layers:
+        if not any(a.name == name for a in vl.aovs):
+            aov = vl.aovs.add()
+            aov.name, aov.type = name, "VALUE"
     for mat in materials:
         if mat.node_tree and not any(n.type == "OUTPUT_AOV" and n.aov_name == name for n in mat.node_tree.nodes):
             n = mat.node_tree.nodes.new("ShaderNodeOutputAOV")
             n.aov_name = name
             n.inputs["Value"].default_value = 1.0
+
+
+REFLECTION_LAYER = "HG reflection"
+# Character slot -> half width, half height (pixels of the 512 x 448 frame) of the box around the root
+# bone that must overlap the mirror quad on screen (Reflection_CharSlot); others +-20 x +-30.
+_REFLECTION_BOX = {0: (10.0, 30.0), 1: (20.0, 15.0)}
+
+
+def _gltf_to_blender(v):
+    """glTF (Y up) to Blender (Z up), as the importer converts."""
+    from mathutils import Vector
+    return Vector((v[0], -v[2], v[1]))
+
+
+def _hg_collections(scene, actor_objs: list) -> dict:
+    """Split the scene into collections the extra view layers (reflections,
+    character shadows) can leave out: the room and props, the actors, the
+    lights. The cameras stay in the scene collection, so every layer has them."""
+    if "HG scene" in bpy.data.collections:
+        return {k: bpy.data.collections[f"HG {k}"] for k in ("scene", "actors", "lights")}
+    out = {}
+    for k in ("scene", "actors", "lights"):
+        out[k] = bpy.data.collections.new(f"HG {k}")
+        scene.collection.children.link(out[k])
+    actors = set(actor_objs)
+    for o in list(scene.collection.objects):
+        if o.type == "CAMERA":
+            continue
+        key = "lights" if o.type == "LIGHT" else "actors" if o in actors else "scene"
+        out[key].objects.link(o)
+        scene.collection.objects.unlink(o)
+    return out
+
+
+def apply_reflections(scene, camera, cut_json: dict, room_refs: list, root: Path, rigs: list, slots: dict,
+                      actor_objs: list, report: list):
+    """Character reflections (export/reflection.py): for each live mirror
+    quad, a mirrored instance of every actor's meshes in a view layer of
+    their own (the game draws them over the picture with a depth buffer of
+    their own, so the room never hides them), visible only on frames where
+    the game accepts the character: the mirror image of its bone 0, projected
+    to the 512 x 448 frame with a box around it, overlaps the rectangle around
+    the projected quad (the game tests through the mirrored camera). The compositor blends the layer in before the tint (see
+    apply_screen_effects). Returns the strengths per frame or None."""
+    from bpy_extras.object_utils import world_to_camera_view
+    from mathutils import Matrix, Vector
+    extras = next((n.get("extras", {}) for n in cut_json.get("nodes", []) if "story_state" in n.get("extras", {})), {})
+    live = {r["slot"]: r["frames"] for r in extras.get("reflections", [])}
+    if not live:
+        return None
+    quads = {}
+    for ref in room_refs:
+        room_file = root / ref["room_file"]
+        if not room_file.is_file():
+            continue
+        for node in read_gltf_json(room_file).get("nodes", []):
+            for q in node.get("extras", {}).get("room_effects", {}).get("reflections", []):
+                if q["slot"] in live:
+                    quads[q["slot"]] = q
+    quads = {k: q for k, q in quads.items() if k in live}
+    if not quads:
+        report.append("reflections: the event's room export has no reflection quads (re-export the stages)")
+        return None
+
+    lights = _hg_collections(scene, actor_objs)["lights"]
+
+    mirrors = {}
+    for slot, q in sorted(quads.items()):
+        c = [_gltf_to_blender(v) for v in q["corners"]]
+        n = (c[1] - c[0]).cross(c[2] - c[0]).normalized()
+        refl = Matrix.Identity(4)
+        for i in range(3):
+            for j in range(3):
+                refl[i][j] -= 2.0 * n[i] * n[j]
+        mirrors[slot] = (Matrix.Translation(c[0]) @ refl @ Matrix.Translation(-c[0]), c, q)
+    # one collection and view layer per mirror: the game lights a character before mirroring it, so the
+    # mirror images are lit by mirrored lights (an instance of the lights), which must not reach the others
+    mirror_colls = {}
+    for k, (mat, _c, _q) in mirrors.items():
+        mc = bpy.data.collections.new(f"HG reflection {k}")
+        scene.collection.children.link(mc)
+        le = bpy.data.objects.new(f"lights mirror {k}", None)
+        le.instance_type, le.instance_collection = "COLLECTION", lights
+        le.matrix_world = mat
+        mc.objects.link(le)
+        mirror_colls[k] = mc
+
+    def keyed(o, path):
+        return next((fc for fc in fcurves_of(o) if fc.data_path == path), None)
+
+    actors = []
+    for arm, meshes, model in rigs:
+        slot = slots.get(arm.name, 1)
+        coll = bpy.data.collections.new(f"HG mirror {arm.name}")
+        # the meshes the actor shows: visible now or keyed (scale_to_visibility hides them off stage)
+        shown_meshes = [m for m in meshes if not m.hide_render or keyed(m, "hide_render")]
+        for m in shown_meshes:
+            coll.objects.link(m)
+        root_bone = arm.data.bones.get("J00") or next(b for b in arm.data.bones if b.parent is None)   # bone 0
+        empties = {}
+        for k, (mat, _c, _q) in mirrors.items():
+            e = bpy.data.objects.new(f"{arm.name} mirror {k}", None)
+            e.instance_type, e.instance_collection = "COLLECTION", coll
+            e.matrix_world = mat
+            mirror_colls[k].objects.link(e)
+            empties[k] = (e, tuple(e.scale))
+        actors.append((arm, root_bone, slot - 1, empties, shown_meshes))
+
+    def on_stage(meshes, f):
+        for m in meshes:
+            fc = keyed(m, "hide_render")
+            if (fc.evaluate(f) < 0.5) if fc else not m.hide_render:
+                return True
+        return False
+
+    # the game's acceptance test, per frame; the meshes' modifiers (skinning, simulation) are switched off
+    # while stepping, only the armatures and the camera are needed. A rejected actor's mirror instance is
+    # scaled to 0 (keyed: a hidden object would drop out of the evaluation and never come back)
+    frames = sorted({f for ranges in live.values() for a, b in ranges for f in range(a, b + 1)})
+    paused = [(md, md.show_viewport) for o in scene.objects if o.type == "MESH" for md in o.modifiers]
+    for md, _v in paused:
+        md.show_viewport = False
+    W, H = 512.0, 448.0
+    shown = 0
+    try:
+        state = {}
+        for f in range(scene.frame_start, scene.frame_end + 1):
+            on = f in frames
+            if on:
+                scene.frame_set(f)
+            for arm, bone, slot, empties, meshes in actors:
+                for k, (mat, corners, q) in mirrors.items():
+                    vis = False
+                    if on and any(a <= f <= b for a, b in live.get(k, [])) and on_stage(meshes, f):
+                        pts = [world_to_camera_view(scene, camera, v) for v in corners]
+                        # the game tests through the mirrored camera: where the mirror image of bone 0 lands
+                        head = world_to_camera_view(scene, camera,
+                                                    mat @ arm.matrix_world @ arm.pose.bones[bone.name].head)
+                        if head.z > 0:
+                            xs, ys = [p.x * W for p in pts], [(1 - p.y) * H for p in pts]
+                            bx, by = _REFLECTION_BOX.get(slot, (20.0, 30.0))
+                            x, y = head.x * W, (1 - head.y) * H
+                            if q.get("horizontal"):
+                                y += 0.5 * by
+                            vis = x + bx > min(xs) and x - bx < max(xs) and y + by > min(ys) and y - by < max(ys)
+                    e, full = empties[k]
+                    if state.get(e.name) != vis or f == scene.frame_start:
+                        e.scale = full if vis else (0.0, 0.0, 0.0)
+                        e.keyframe_insert("scale", frame=f)
+                        state[e.name] = vis
+                    shown += vis
+    finally:
+        for md, v in paused:
+            md.show_viewport = v
+    for actor in actors:
+        for e, _full in actor[3].values():
+            constant_keys(e, "scale")
+
+    main_layer = scene.view_layers[0]
+    out = []
+    for k, (_m, _c, q) in mirrors.items():
+        layer = scene.view_layers.new(f"{REFLECTION_LAYER} {k}")
+        for lc in layer.layer_collection.children:
+            lc.exclude = lc.collection.name != mirror_colls[k].name
+        main_layer.layer_collection.children[mirror_colls[k].name].exclude = True
+        out.append({"layer": layer.name, "slot": k,
+                    "ranges": [(a, b, q["strength"] / 128.0) for a, b in live[k]]})
+    report.append(f"reflections: {len(mirrors)} quad(s) "
+                  + ", ".join(f"slot {k} strength {q['strength']} live {live[k]}" for k, (_m, _c, q) in mirrors.items())
+                  + f"; {shown} actor-frames accepted")
+    return out
+
+
+SHADOW_LAYER = "HG shadow"
+SHADOW_BONE = "J02"                       # the bone the game measures a character's distance to the light from
+# The shadow object's stored alpha, int(64 x intensity x u^4) with u = 1 - d^2 / range^2: below this the game
+# draws no shadow (measured: 8 and 9 shadow, 7 and less do not)
+SHADOW_MIN_ALPHA = 8
+# The room hides a character's shadow where it stands between the surface and the character: tested
+# from this far along the way from the bone to the light (0 = the bone, 1 = the light)
+SHADOW_VIEW = 0.8
+# per-model offset of that point (the shadow object's +704, game units, world Y)
+_SHADOW_OFFSET = {"HEW": -2.81}
+
+
+def _shadow_receiver_material(name: str):
+    """White diffuse whose normal (node "facing", keyed) always faces the
+    shadow light: the shadow pass then marks only what the shadow boxes hide
+    from it (the game's stencil volumes darken nothing else, whichever way a
+    surface faces)."""
+    mat = bpy.data.materials.new(f"HG shadow receiver {name}")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    facing = nt.nodes.new("ShaderNodeCombineXYZ")
+    facing.name = "facing"
+    facing.inputs[2].default_value = 1.0
+    dif = nt.nodes.new("ShaderNodeBsdfDiffuse")
+    nt.links.new(facing.outputs[0], dif.inputs["Normal"])
+    nt.links.new(dif.outputs[0], nt.nodes.new("ShaderNodeOutputMaterial").inputs[0])
+    return mat
+
+
+def _shadow_room_copies(scene, source, name: str, cast: bool):
+    """Copies of the room's meshes for the shadow layers, without their
+    translucent faces (the game draws blended triangles after the stencil and
+    without depth writes, so they neither receive nor hide a shadow). The
+    copies keep their parents and animation; `cast` sets whether they cast
+    shadows themselves."""
+    import bmesh
+    coll = bpy.data.collections.new(name)
+    scene.collection.children.link(coll)
+    trimmed = {}
+    for o in source.objects:
+        if o.type != "MESH":
+            continue
+        blended = {i for i, ms in enumerate(o.material_slots)
+                   if ms.material and getattr(ms.material, "surface_render_method", "") == "BLENDED"}
+        if blended and len(blended) == len(o.material_slots):
+            continue
+        c = o.copy()
+        if blended:
+            if o.data.name not in trimmed:
+                me = o.data.copy()
+                bm = bmesh.new()
+                bm.from_mesh(me)
+                bmesh.ops.delete(bm, geom=[f for f in bm.faces if f.material_index in blended], context="FACES")
+                bm.to_mesh(me)
+                bm.free()
+                trimmed[o.data.name] = me
+            c.data = trimmed[o.data.name]
+        c.visible_shadow = cast
+        coll.objects.link(c)
+    return coll
+
+
+def apply_character_shadows(scene, rigs: list, room_refs: list, actor_objs: list, report: list):
+    """The game's character shadows (docs/FORMATS.md "Character shadows"):
+    stencil volumes of a character's shadow boxes (the <model>_shadow export),
+    all extruded in one direction, from one room light towards the character,
+    darken the picture behind them, for the room light (of those with a
+    non-zero volume length, `param_unused`) that gives the largest value; d is
+    the distance from the light to the character's bone J02 and u = 1 - d^2 /
+    range^2. There is a shadow only where the game's stored alpha, int(64 x
+    intensity x u^4), is SHADOW_MIN_ALPHA or more; its strength here is 64 x
+    intensity x u / 128 of the finished picture, which matches the game's
+    final darkening on the frames checked (the game's own darkening, applied
+    before its fog and tint, was not fully decoded). Characters are not darkened, and neither are
+    surfaces the room itself hides from that light.
+
+    Here, per actor with shadow boxes, two view layers render the room (its
+    opaque faces) in a white material: one with the boxes casting from a sun
+    keyed to the direction from the chosen light to the bone (the material's
+    normal faces the sun, so only the boxes count), one with the room casting
+    from a point light SHADOW_VIEW of the way from the bone to the chosen
+    light (whether the room stands between the surface and the character). The compositor darkens the picture by alpha / 128 where
+    the first's shadow pass is dark, the second's is not, and no character is
+    drawn. Returns [{layer, lit_layer, name, keys [(frame, strength)]}]."""
+    from mathutils import Vector
+    bpy.context.view_layer.update()               # the room lights' world positions (parented under the rooms)
+    rooms = {}
+    for ref in room_refs:
+        prefix = base_name(ref.name) + "_light"
+        rooms[ref.name] = [(o.matrix_world.translation.copy(), float(o.get("game_intensity", 0.0)),
+                            float(o.get("range_game_units", 0.0)) * UNIT)
+                           for o in scene.objects
+                           if o.type == "LIGHT" and base_name(o.name).startswith(prefix)
+                           and float(o.get("param_unused", 0.0)) != 0.0 and float(o.get("range_game_units", 0.0)) > 0]
+    if not any(rooms.values()):
+        return None
+    colls = _hg_collections(scene, actor_objs)
+
+    def keyed(o, path):
+        return next((fc for fc in fcurves_of(o) if fc.data_path == path), None)
+
+    casters = []
+    for arm, meshes, model in rigs:
+        shadow_file = model.with_name(model.stem + "_shadow" + model.suffix)
+        if not shadow_file.is_file() or SHADOW_BONE not in arm.pose.bones:
+            continue
+        objs = import_gltf(shadow_file)
+        boxes = [o for o in objs if o.type == "MESH"]
+        if not boxes:
+            continue
+        box = boxes[0]
+        for md in box.modifiers:
+            if md.type == "ARMATURE":
+                md.object = arm
+        box.parent = arm
+        box.matrix_parent_inverse = arm.matrix_world.inverted()
+        box.visible_camera = False
+        box.visible_shadow = True
+        for o in objs:
+            if o is not box:
+                bpy.data.objects.remove(o, do_unlink=True)
+        coll = bpy.data.collections.new(f"{SHADOW_LAYER} {arm.name}")
+        lamp_coll = bpy.data.collections.new(f"{SHADOW_LAYER} {arm.name} lamp")
+        for c in (coll, lamp_coll):
+            scene.collection.children.link(c)
+        for c in box.users_collection:
+            c.objects.unlink(box)
+        coll.objects.link(box)
+        data = bpy.data.lights.new(f"shadow light {arm.name}", "SUN")
+        data.energy, data.angle, data.use_shadow = 3.0, 0.0, True
+        light = bpy.data.objects.new(f"shadow light {arm.name}", data)
+        light["hg_shadow_light"] = True
+        coll.objects.link(light)
+        light["hg_receiver"] = _shadow_receiver_material(arm.name).name
+        ldata = bpy.data.lights.new(f"shadow lamp {arm.name}", "POINT")
+        ldata.energy, ldata.shadow_soft_size, ldata.use_shadow = 1000.0, 0.0, True
+        lamp = bpy.data.objects.new(f"shadow lamp {arm.name}", ldata)
+        lamp["hg_shadow_light"] = True
+        lamp_coll.objects.link(lamp)
+        offset = next((v for k, v in _SHADOW_OFFSET.items() if base_name(arm.name).startswith(k)), 0.0)
+        on_meshes = [m for m in meshes if not m.hide_render or keyed(m, "hide_render")]
+        casters.append((arm, light, lamp, coll, lamp_coll, Vector((0.0, 0.0, offset * UNIT)), on_meshes))
+    if not casters:
+        return None
+    receivers = _shadow_room_copies(scene, colls["scene"], f"{SHADOW_LAYER} receivers", cast=False)
+    occluders = _shadow_room_copies(scene, colls["scene"], f"{SHADOW_LAYER} occluders", cast=True)
+
+    def on_stage(ms, f):
+        for m in ms:
+            fc = keyed(m, "hide_render")
+            if (fc.evaluate(f) < 0.5) if fc else not m.hide_render:
+                return True
+        return False
+
+    paused = [(md, md.show_viewport) for o in scene.objects if o.type == "MESH" for md in o.modifiers]
+    for md, _v in paused:
+        md.show_viewport = False
+    keys = {arm.name: [] for arm, *_ in casters}
+    facing = {arm.name: bpy.data.materials[light["hg_receiver"]].node_tree.nodes["facing"]
+              for arm, light, *_ in casters}
+    try:
+        state = {}
+        for f in range(scene.frame_start, scene.frame_end + 1):
+            scene.frame_set(f)
+            ref = _room_of_cut(room_refs, f)
+            room_lights = rooms.get(ref.name, []) if ref else []
+            for arm, light, lamp, _c, _lc, offset, ms in casters:
+                best, where, pos = 0.0, None, None
+                if on_stage(ms, f):
+                    pos = arm.matrix_world @ arm.pose.bones[SHADOW_BONE].head + offset
+                    for at, intensity, rng in room_lights:
+                        u = 1.0 - (at - pos).length_squared / (rng * rng)
+                        if u > 0.0 and int(64.0 * intensity * u ** 4) >= SHADOW_MIN_ALPHA and 64.0 * intensity * u > best:
+                            best, where = 64.0 * intensity * u, at
+                strength = min(best, 128.0) / 128.0
+                if strength > 0.0:              # the direction from the light to the bone, every frame
+                    d = (pos - where).normalized()
+                    light.rotation_euler = d.to_track_quat("-Z", "Y").to_euler()
+                    light.keyframe_insert("rotation_euler", frame=f)
+                    node = facing[arm.name]
+                    for i in range(3):
+                        node.inputs[i].default_value = -d[i]
+                        node.inputs[i].keyframe_insert("default_value", frame=f)
+                    lamp.location = pos.lerp(where, SHADOW_VIEW)    # what the room leaves visible from there
+                    lamp.keyframe_insert("location", frame=f)
+                last = state.get(arm.name)
+                if last is None or abs(last - strength) > 1e-4:
+                    keys[arm.name].append((f, strength))
+                    state[arm.name] = strength
+    finally:
+        for md, v in paused:
+            md.show_viewport = v
+    lit_material = bpy.data.materials.new("HG shadow lit")
+    out = []
+    own = {}
+    for arm, light, lamp, coll, lamp_coll, _offset, _ms in casters:
+        constant_keys(lamp, "location")
+        layer = scene.view_layers.new(f"{SHADOW_LAYER} {arm.name}")
+        layer.material_override = bpy.data.materials[light["hg_receiver"]]
+        lit = scene.view_layers.new(f"{SHADOW_LAYER} {arm.name} lit")
+        lit.material_override = lit_material
+        own[layer.name] = (receivers.name, coll.name)
+        own[lit.name] = (occluders.name, lamp_coll.name)
+        out.append({"layer": layer.name, "lit_layer": lit.name, "name": arm.name, "keys": keys[arm.name]})
+    shadow_colls = {receivers.name, occluders.name}
+    for _a, _l, _p, coll, lamp_coll, _o, _m in casters:
+        shadow_colls |= {coll.name, lamp_coll.name}
+    for vl in scene.view_layers:                  # (bpy wrappers are new objects on every access: compare names)
+        if vl.name in own:
+            vl.use_pass_shadow = True
+            for lc in vl.layer_collection.children:
+                lc.exclude = lc.collection.name not in own[vl.name]
+        else:
+            for lc in vl.layer_collection.children:
+                if lc.collection.name in shadow_colls:
+                    lc.exclude = True
+    shown = sum(1 for o in out for f, k in o["keys"] if k > 0)
+    report.append(f"character shadows: {len(out)} actor(s) with shadow boxes, "
+                  + ", ".join(f"{o['name']} max alpha {round(128 * max([k for _f, k in o['keys']] or [0]))}"
+                              for o in out) + f" ({shown} changes to a visible shadow)")
+    return out
 
 
 class _Comp:
@@ -665,7 +1078,7 @@ class _Comp:
 
 def apply_screen_effects(scene, actor_objs: list, room_objs: list, cut_json: dict, room_refs: list, root: Path,
                          report: list, fog: bool = True, look: str = "hybrid", time_of_day: str = "story",
-                         display: bool = False) -> None:
+                         display: bool = False, reflections=None, shadows=None) -> None:
     """The game's screen effects per cut, built in the compositor (see
     hgexport/export/look.py and docs/BLENDER_CUTSCENES.md "Screen look"): the
     room's tint, the fog, the glow geometry (lamps) put back over them, and
@@ -712,7 +1125,7 @@ def apply_screen_effects(scene, actor_objs: list, room_objs: list, cut_json: dic
                 if fx:
                     room_fx[ref.name] = fx
                     break
-    if not cuts or (not fog and look == "none"):
+    if not cuts or (not fog and look == "none" and not reflections and not shadows):
         return
     states, fog_state, room = [], None, None
     for frame in cuts:
@@ -794,8 +1207,43 @@ def apply_screen_effects(scene, actor_objs: list, room_objs: list, cut_json: dic
 
     image = rl.outputs["Image"]
     s0 = image if display else C.convert(image, "Linear Rec.709", "sRGB")
-    s = C.mix("DARKEN", s0, 1.0, clamp=False) if look == "modern" else s0     # HDR lamps: drawn after the tint
     exact = C.quantize if display else (lambda x: x)      # display values: the GS rounds each pass down
+    base = s0
+    if shadows:
+        _add_aov(scene, "hg_character", {ms.material for o in actor_objs if o.type == "MESH"
+                                         for ms in o.material_slots if ms.material})
+    if reflections:
+        _add_aov(scene, "hg_character", {ms.material for o in actor_objs if o.type == "MESH"
+                                         for ms in o.material_slots if ms.material})
+    for refl in reflections or ():
+        # the mirrored characters over a half-size copy of the picture, softened (a copy blended with four
+        # diagonal one-pixel shifts at 32/128 each in turn, the sharp characters back at 96/128), blended in
+        # at the strength where they were drawn (alpha test != 0), before the tint (export/reflection.py)
+        rr = C.node("CompositorNodeRLayers")
+        rr.scene, rr.layer = scene, refl["layer"]
+        r_img = rr.outputs["Image"] if display else C.convert(rr.outputs["Image"], "Linear Rec.709", "sRGB")
+        cover = C.math("MINIMUM", C.math("MAXIMUM", rr.outputs["hg_character"], 0.0), 1.0)
+        a = C.add(C.mul(base, C.math("SUBTRACT", 1.0, cover)), r_img)    # the world is black: premultiplied
+        if look == "emulate":
+            a = C.pixelate(a, px)
+            cover = C.pixelate(cover, px)
+            step_x = step_y = px
+        else:
+            step_x, step_y = hx, hy
+        b = a
+        for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            b = C.lerp(b, C.shift(a, dx * step_x, dy * step_y), 0.25)
+        soft = C.lerp(b, a, 0.75)
+        if look == "emulate":
+            soft = C.blur(soft, 0.45 * px, 0.45 * px)                   # the bilinear enlargement
+            cover = C.blur(cover, 0.45 * px, 0.45 * px)
+        else:
+            soft = C.blur(soft, 0.25 * hx, 0.25 * hy)                   # the half-size buffer, enlarged
+            cover = C.blur(cover, 0.25 * hx, 0.25 * hy)
+        mask = C.math("GREATER_THAN", cover, 0.002)
+        strength = C.node("ShaderNodeValue", f"reflection_strength_{refl['slot']}")   # keyed below
+        base = exact(C.lerp(base, soft, C.math("MULTIPLY", mask, strength.outputs[0])))
+    s = C.mix("DARKEN", base, 1.0, clamp=False) if look == "modern" else base    # HDR lamps: drawn after the tint
     if look != "none":
         c0, k0 = colour("tint_colour1"), value("tint_strength1")
         s = exact(C.add(s, C.mul(glow_buffer(s), c0), k0))
@@ -822,6 +1270,23 @@ def apply_screen_effects(scene, actor_objs: list, room_objs: list, cut_json: dic
         a = C.math("MULTIPLY", a, C.math("SUBTRACT", 1.0, C.math("MULTIPLY", char_mask, keep_chars)))
         a = C.math("MULTIPLY", a, on)
         s = exact(C.lerp(s, fog_rgb, a))
+
+    for sh in shadows or ():
+        # the character shadows: the picture darkened by alpha / 128 where the actor's shadow boxes hide
+        # the light, characters excepted, after the tint and the fog (the measured darkening is the
+        # formula's, not passed through the tint); the stencil is the half-size buffer's alpha
+        rs = C.node("CompositorNodeRLayers")
+        rs.scene, rs.layer = scene, sh["layer"]
+        rlit = C.node("CompositorNodeRLayers")
+        rlit.scene, rlit.layer = scene, sh["lit_layer"]
+        unit = lambda x: C.math("MINIMUM", C.math("MAXIMUM", x, 0.0), 1.0)
+        # in the boxes' shadow, but lit by the light at all (the room hides nothing there)
+        dark = C.math("MULTIPLY", C.math("SUBTRACT", 1.0, unit(rs.outputs["Shadow"])), unit(rlit.outputs["Shadow"]))
+        dark = C.blur(dark, 0.25 * hx, 0.25 * hy) if look != "emulate" else C.pixelate(dark, px)
+        free = C.math("SUBTRACT", 1.0, C.math("MINIMUM", rl.outputs["hg_character"], 1.0))
+        strength = C.node("ShaderNodeValue", f"shadow_strength_{sh['name']}")        # keyed below
+        amount = C.math("MULTIPLY", C.math("MULTIPLY", dark, free), strength.outputs[0])
+        s = exact(C.mul(s, C.math("SUBTRACT", 1.0, amount)))
 
     if look in ("hybrid", "emulate"):
         glow = rl.outputs["hg_glow"]
@@ -866,6 +1331,23 @@ def apply_screen_effects(scene, actor_objs: list, room_objs: list, cut_json: dic
         if name in ng.nodes:
             ng.nodes[name].outputs[0].default_value = (*rgb, 1.0)
 
+    for sh in shadows or ():
+        name = f"shadow_strength_{sh['name']}"
+        for frame, k in sh["keys"]:
+            set_value(name, k)
+            ng.nodes[name].outputs[0].keyframe_insert("default_value", frame=frame)
+        constant_keys(ng, f'nodes["{name}"].outputs[0].default_value')
+    for refl in reflections or ():
+        name = f"reflection_strength_{refl['slot']}"
+        keys = {}
+        for a, b, k in refl["ranges"]:
+            keys[a] = k
+            keys.setdefault(b + 1, 0.0)
+        keys.setdefault(scene.frame_start, 0.0)
+        for frame in sorted(keys):
+            set_value(name, keys[frame])
+            ng.nodes[name].outputs[0].keyframe_insert("default_value", frame=frame)
+        constant_keys(ng, f'nodes["{name}"].outputs[0].default_value')
     for frame, fog_st, lk in states:
         if fog:
             if fog_st:
@@ -1029,7 +1511,7 @@ def match_game_rendering(actor_objs: list, room_objs: list, objs: list, flags: s
     *Dithered* sorts them the same way), a room's after its opaque geometry
     (decals such as the soft shadows under plates lie on the opaque surface
     and are blended over it, which EEVEE's *Blended* does)."""
-    lights = {o.data for o in objs if o.type == "LIGHT"}
+    lights = {o.data for o in objs if o.type == "LIGHT" and not o.get("hg_shadow_light")}
     if "--shadows" not in flags:
         for light in lights:
             light.use_shadow = False
@@ -2134,7 +2616,7 @@ def main(argv: list[str], from_cli: bool) -> None:
     while i < len(argv):
         if argv[i] in ("--keep-current", "--no-sound", "--no-movie", "--no-cut-lighting", "--no-fog", "--shadows",
                        "--blended", "--no-letterbox", "--end-fade", "--start-fade",
-                       "--no-physics", "--bake-physics"):
+                       "--no-physics", "--bake-physics", "--no-reflections", "--no-character-shadows"):
             flags.add(argv[i])
         elif argv[i] in opts:
             opts[argv[i]] = argv[i + 1]
@@ -2162,6 +2644,7 @@ def main(argv: list[str], from_cli: bool) -> None:
     room_refs = [o for o in cut_objs if "room_file" in o.keys()]
     report = []
     actor_objs, room_objs, rigs = [], [], []
+    actor_slots = {}
 
     # 2. actors: import each character, hand it the cutscene action
     for actor in actors:
@@ -2179,6 +2662,7 @@ def main(argv: list[str], from_cli: bool) -> None:
         # scale keys that hide the actor while it is off stage.
         copy_animation(actor, arm)
         rigs.append((arm, [o for o in objs if o.type == "MESH"], model))
+        actor_slots[arm.name] = int(actor.get("dp_actor_slot", 1))
         carrier = next((c for c in actor.children if c.type == "MESH" and c.data.shape_keys), None)
         if carrier is not None and carrier.data.shape_keys.animation_data:
             names = {k.name for k in carrier.data.shape_keys.key_blocks[1:]}
@@ -2262,9 +2746,15 @@ def main(argv: list[str], from_cli: bool) -> None:
         apply_game_shading(actor_objs, report)
     if "--no-cut-lighting" not in flags:
         apply_cut_lighting(scene, camera, read_gltf_json(cutscene), room_refs, root, report, game_units=game_shading)
+    reflections = shadows = None
+    if "--no-reflections" not in flags:
+        reflections = apply_reflections(scene, camera, read_gltf_json(cutscene), room_refs, root, rigs, actor_slots,
+                                        actor_objs, report)
+    if "--no-character-shadows" not in flags:
+        shadows = apply_character_shadows(scene, rigs, room_refs, actor_objs, report)
     apply_screen_effects(scene, actor_objs, room_objs, read_gltf_json(cutscene), room_refs, root, report,
                          fog="--no-fog" not in flags, look=opts["--look"], time_of_day=opts["--time-of-day"],
-                         display=DISPLAY_SPACE)
+                         display=DISPLAY_SPACE, reflections=reflections, shadows=shadows)
     apply_frame_overlays(scene, read_gltf_json(cutscene), report, letterbox="--no-letterbox" not in flags,
                          end_fade="--end-fade" in flags, display=DISPLAY_SPACE,
                          start_fade="--start-fade" in flags,

@@ -230,8 +230,11 @@ some rooms use early in the story; the lamps are a separate `<room>_glow`
 object (`--emissive-glow` makes them emissive for engines). The Blender
 assembly script rebuilds the effects (`--look hybrid`, `emulate` or
 `modern`; `--time-of-day`), rendering in display values as the PS2 does
-(`--render-space`), with the game's letterbox (`--no-letterbox`) and,
-optionally, the gallery's end fade (`--end-fade`); see
+(`--render-space`), with the game's letterbox (`--no-letterbox`), the
+character reflections in some rooms' windows, mirrors and floors
+(`room_effects.reflections`; `--no-reflections`), the characters' shadows
+on the room (`--no-character-shadows`) and, optionally, the gallery's end
+fade (`--end-fade`); see
 [docs/BLENDER_CUTSCENES.md](docs/BLENDER_CUTSCENES.md) and, for how the game
 does it, [docs/FORMATS.md](docs/FORMATS.md#screen-look-tint-glow-geometry-and-bloom).
 

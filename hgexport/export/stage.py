@@ -12,6 +12,7 @@ from ..gltf.builder import GltfBuilder
 from ..util.mathutil import euler_to_quat, look_at_quat, make_continuous
 from .alpha import assign_modes
 from .look import LOOK_NOTE, engine_looks, room_variants
+from .reflection import REFLECTION_NOTE, room_reflections
 from .meshutil import VertexWelder
 from .textures import MaterialFactory, TextureSet
 
@@ -222,6 +223,10 @@ class StageBuilder:
             extras["room_effects"]["engine_look"] = engine_looks(st.effects, variants)
             extras["room_effects_note"] = ("PAC slot 13 screen effects: fog (RGBA colours, start/end distance in "
                                            "game units), depth effect (four distances). " + LOOK_NOTE)
+        reflections = room_reflections(st.name, s)
+        if reflections:
+            extras.setdefault("room_effects", {})["reflections"] = reflections
+            extras["room_reflections_note"] = REFLECTION_NOTE
         root = b.node({"name": st.name, "extras": extras}, root=parent is None)
         if parent is not None:
             b.add_child(parent, root)

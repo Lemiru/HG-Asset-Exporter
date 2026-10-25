@@ -133,6 +133,8 @@ Options, all placed after the cutscene path:
 | `--resolution WxH` | render size (default 1440x1080; the game is 4:3) |
 | `--no-sound` | leave out the soundtrack |
 | `--no-movie` | leave out the movie layer |
+| `--no-reflections` | leave out the character reflections in windows, mirrors and floors |
+| `--no-character-shadows` | leave out the characters' shadows on the room |
 | `--no-letterbox` | leave out the black bars over the top and bottom of the picture |
 | `--end-fade` | add the movie gallery's fade to black over the event's last 14 frames |
 | `--start-fade` | add the movie gallery's fade in from black over the event's first 17 frames |
@@ -208,7 +210,9 @@ physical` needs it.
 
 **Game-like rendering.**
 
-* The game's lights cast no shadows, so the script turns shadows off.
+* The game's lights cast no shadows on the characters, so the script
+  turns the lights' shadows off (the characters' shadows on the room are
+  drawn separately, see *Character shadows*).
   Otherwise hair strands and low-poly edges throw hard shadows across
   faces.
 * Characters' transparent materials are switched from *Blended* to
@@ -260,8 +264,10 @@ back at the end.
   again after changing the render size.
 * `--time-of-day` chooses the tint the rooms show: `story` (default) as the
   cutscene plays in the story (warm only for the opening EV0002 and
-  EV0003), `gallery` as the game's movie gallery shows it (warm in most of
-  the first area's rooms), `warm`, or `night` (the rooms' own values).
+  EV0003), `gallery` as the game's movie gallery shows it (the rooms' own
+  values and what the event's replay script sets: warm for eleven events of
+  the first area, a blue bloom for DE0003 and DE0011), `warm`, or `night`
+  (the rooms' own values).
 
 These effects only show in renders and in the viewport's compositor preview.
 
@@ -276,6 +282,36 @@ the picture as it is, brighter than its high value cover it. So the dim
 parts barely show: DE000C's lens flare is a faint haze with a brighter
 core, not the full movie. A movie strip in
 Blender's sequencer would replace the render, so it is not used.
+
+**Reflections.** Some rooms show the characters mirrored in a window, a
+mirror or the floor (for example Fiona at the bedroom window in EV0005).
+The game draws them without clipping them to the glass: the mirror image
+of every character it accepts, over the picture at the room's strength,
+softened and at half resolution, before the tint and fog. The script does
+the same: for each mirror that is live in the event (`reflections` in the
+cutscene extras, `room_effects.reflections` in the room), a view layer
+*HG reflection <slot>* holds a mirrored instance of every actor and of
+the lights (the game lights a character before mirroring it), the
+compositor blends that layer in, and an actor's instance is scaled to 0 on
+frames where the game would not draw it: where the mirror image of its
+bone 0, with a box of 20 by 60 pixels of the 512 × 448 frame around it
+(Hewie 40 by 30), misses the rectangle around the mirror on screen. Each
+mirror is one more render layer, so these events render slower.
+
+**Character shadows.** The game darkens the room behind each character
+with stencil volumes of its shadow boxes (the `<model>_shadow` export),
+cast from one of the room's lights. The script imports each actor's boxes,
+binds them to its skeleton and gives the actor two view layers that render
+only the room's opaque faces in a plain material: *HG shadow <actor>*, lit
+by a sun the boxes cast from, and *HG shadow <actor> lit*, where the room
+itself casts from a point light between the character and the chosen
+light. The compositor darkens the picture, after the tint and the fog,
+where the first layer is in shadow, the second is not (the room does not
+stand between the surface and the character) and no character is drawn.
+The sun's direction (from the chosen light to the character), the point
+light and the strength are keyed per frame from the game's rule (FORMATS.md);
+characters are never darkened, nor are translucent surfaces such as window
+glass. Each actor with shadow boxes adds two render layers.
 
 **Cloth and hair physics.** The game does not animate cloth, hair or chests
 with keyframes; it simulates them while the game runs (see

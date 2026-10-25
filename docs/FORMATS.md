@@ -283,7 +283,8 @@ specular at all.
 with `character --shadow-volumes`.*
 
 The game casts character shadows with stencil shadow volumes: simple boxes,
-one per bone, whose outline it extends away from the light. Layout: `u32`
+one per bone, extruded from one room light's direction (see "Character
+shadows" under the screen effects). Layout: `u32`
 count, 12 bytes padding, 32-byte descriptors (`u32 bone, u32 faces`, offsets
 of the face, edge and vertex lists); faces are 48 bytes (4 vertex numbers, 4
 edge numbers, a normal), edges pairs of `u32`, vertices `float4` in the
@@ -653,12 +654,98 @@ until story flag 2 is set (room 0x21 until flag 1); rooms 0xE0–0xE9 while the
 story phase variable 0x2E is 1; rooms 0x00 and 0xE9 also get a strong blue
 bloom then. Flag 2 is set when Fiona first leaves room 0x21 after EV0002,
 flag 1 by an examine event in room 0x12, so only EV0002 and EV0003 play in
-the warm look in the story. The movie gallery plays every cutscene with no
-story flags set, so it shows the warm look in all of these rooms. The
-exporter lists the replacements as `room_effects.script_variants` with their
-conditions (`hgexport/export/look.py`) and each cutscene's story flags as
-`story_state` in the cutscene's extras. Rooms 0x35 and 0x92 change their
-look after a cutscene (EV0033, DE0048), not during it.
+the warm look in the story.
+
+The script that plays a cutscene can set them too, before the cutscene or
+right after it waits for the cutscene to start, which is still before its
+first frame: EV0033 plays in room 0x35 with a blue-grey tint and a violet
+bloom its script sets (DE0048's script sets room 0x92's own values again).
+
+**The movie gallery** (room 0x37) switches on the entry (progress variable
+0x2A) to the event's room (command 0x3A, `3A hi lo`) and then runs one of
+that room's actions (command 0x92; the switch at 0x3D6C18 is shared by the
+gallery's actions): a replay script near the end of the room's action list
+that plays just that cutscene. The rooms' enter scripts do not run, and the
+story flags are all clear, so a cutscene shows its room's own (night) look
+unless the replay script changes it: the warm tint in EV0002, EV0003,
+DE000E, DE0000, DE0001, DE0002, DE001B, DE0010, DE000F and EV0004, the deep
+warm tint in DE000A, the blue bloom in DE0003 and DE0011, and EV0033's look.
+Everything else, EV0014 in room 0x11 for example, plays in the night look.
+For events that can play in several rooms the gallery's switch picks one
+(DE000A in room 0x25, DE0040 in 0x8A, EV0030 in 0x8D); the exporter prefers
+it when the floor fits tie.
+
+The exporter lists the replacements as `room_effects.script_variants` with
+their conditions (`hgexport/export/look.py`): `story_flag_clear` /
+`story_phase` for the enter scripts (story only), `story_events` and
+`gallery_events` for the scripts that play an event. Each cutscene's story
+flags are `story_state` in the cutscene's extras.
+
+**Reflections.** Eleven rooms' own code (not their scripts) registers a
+reflection effect (method table 0x472F60) in effect slot 26 or 27 with a
+parameter block: the four corners of a quad in the room's space, a strength
+(0x80 = 1) with flag bits in its top nibble, and 1.0 for floors. The
+bedroom copies 0x21, 0x32 and 0xE0 have a door (slot 26) and a window
+(slot 27) at 64; room 0x31 the window at 64; 0x49 a window at 64; 0x2E,
+0x4B, 0x4E and 0x6A mirrors at 128; 0x55 and 0x60 horizontal quads at 128
+(the strength of 0x60's is set at run time: 0 in EV0017, 128 in EV0018).
+Each frame the effect copies the picture drawn so far, point-sampled, into
+a 256 × 224 buffer (colour only, alpha 0) with a depth buffer of its own;
+draws the characters it accepts there in render mode 23 (character field
++0x152C) through a mirrored camera, lit as they stand, tested only
+against each other; blends the buffer with four copies shifted by one
+pixel diagonally at 32/128 each in turn and the sharp characters back at
+96/128 where they were drawn; and blends it, flipped back, over the frame
+at strength/128 where the alpha is not 0, before the tint and the fog
+(GS packets read on EV0005 frame 2053). It accepts a character when bone
+0, projected through the mirrored camera to the 512 × 448 frame, with a
+box of ±10 × ±30 pixels around it (Fiona, slot 0; Hewie ±20 × ±15, others
+±20 × ±30), overlaps the rectangle around the projected corners. When the
+effect is live depends on the room's code and the event; the exporter
+carries frame ranges watched in the movie gallery (`reflections` in the
+cutscene extras, `hgexport/export/reflection.py`), for example cut 9
+(frames 2006–2084) of EV0005, and the whole of EV0003 and EV0007.
+
+**Character shadows.** Every character has a shadow object (method table
+0x46B1C0) whose draw method (Shadow_Draw 0x1F2B80) stencils the
+character's shadow boxes (the PCK's shadow volumes) into the alpha of the
+256 × 224 work buffer: the alpha is cleared to 127, and each volume
+triangle, drawn with the depth test against the picture, reads that alpha
+as an 8-bit texture (PSMT8H) through one of two palettes that add or
+subtract one (blocks 0x3F30 / 0x3F34). A sprite then marks the pixels the
+count left at 128 or more (destination alpha test) with the shadow's
+alpha, which the object stores at +724 (as `alpha << 24 | 0x808080`):
+`alpha = int(64 × intensity × u⁴)`, `u = 1 − d² / range²`, for a room light
+(the room's slot-4 position, intensity and range), d being the distance
+from the light to the character's bone J02 (Hewie's point is 2.81 units
+lower). Read while EV0007 and EV0014 played, the stored value follows this
+exactly (25.5 → 25, 16.9 → 16, 3.25 → 3, 6.7 → 6).
+
+Measured on held frames by editing one light's record: only lights with a
+non-zero fourth value (exported as `param_unused`) cast; that value is the
+volumes' length in game units (EV0007's fireplace lamp at 75: at 60 the
+floor shadow is the same, at 40 and 35 it covers 65 % and 50 % of it, at
+25 nothing); there is no shadow when the alpha is 7 or less (8 and 9 still
+cast); and the darkening, with the fog and the tint switched off, grows
+with the alpha (0.43 at alpha 10, 0.86 at 20, full at 27) and is then
+softened by the fog and deepened by the tint (0.26 with both). Its exact
+form was not decoded: frame 300 of the same event darkens 0.42 raw at
+alpha 20. The game's final darkening on the frames checked is close to
+`64 × intensity × u / 128` of the finished picture (EV0007 frames 300 and
+900: 0.70 and 0.735 against 0.682 and 0.731), which is what the assembly
+uses, for the light that gives the largest value among those whose stored
+alpha would reach 8. In EV0014 the alphas are 3 and 6 and the game draws
+no shadow; neither does the assembly.
+
+The volumes are extruded in one direction, from the light to that bone,
+not radially: Debilitas's shadow from the fireplace lamp lies on the floor
+in the game and in the assembly, where a point-light shadow climbs the
+walls. Characters are not darkened, and neither are surfaces the room
+itself hides from the character (on EV0007 frame 300 the bed's top and the
+side facing Debilitas are shaded, the front of the bed and the floor beyond
+it are not) or translucent ones (window glass). The assembly tests that
+visibility from a point 0.8 of the way from the bone to the light, which
+reproduces the checked frames, and leaves the volumes unlimited in length.
 
 **Optional objects (visibility groups).** The room geometry's records carry
 a visibility group in the top byte of their control word (exported as

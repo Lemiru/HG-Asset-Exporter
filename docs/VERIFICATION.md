@@ -267,6 +267,77 @@ The letterbox bars cover rows 0–95 and 679–774 of the 775-row captured
 picture in every captured frame of the four cutscenes, i.e. 56 of the 448
 lines at each edge; the assembly's bars cover the same eighth.
 
+### Time of day in the movie gallery
+
+The gallery showed EV0014 in room 0x11's night look although the story
+flags read clear (progress block +0x1C) and the room's enter script sets
+the warm tint while flag 2 is clear. Polling the tint slot while the
+gallery loaded the event showed it going from the gallery's own look
+straight to the room's night values, never warm: the enter scripts do not
+run there. Room 0x37 (the gallery) switches on the entry (progress variable
+0x2A) to the event's room and runs one of that room's actions through a
+shared switch; those actions are short replay scripts at the end of each
+room's action list, and some of them set the warm tint (or, in room 0x00,
+the blue bloom) before the cutscene. Decoding both switches for all 112
+entries and reading the tint and bloom slots while each entry played
+(frames 20–80) gave the same answer for every entry that goes through a
+room (109 of 109; the FILM entry and the two ending variants of EV0034
+are played without the room switch): the room's own values,
+replaced only by what the replay script sets. Polling the slots showed
+EV0033's tint and bloom set before its first frame; its story script sets
+them in the same place as its replay script. The exporter's `gallery` time of day now
+follows these scripts, and the room pick prefers the gallery's room when
+several rooms fit equally (DE000A plays in room 0x25 there, not 0x22).
+
+### Reflections
+
+Paused at Fiona's reflection in EV0005 (frame 2053), the reflection effect
+was live in effect slot 27 with the window quad the room's code builds;
+pointing its draw method at a stub removed the reflection and nothing
+else. The GS packets of that frame give the passes described in
+FORMATS.md. Watching the slot while the event played showed it live only
+in cut 9 (frames 2006–2084), and the same watch over the other events in
+rooms with reflections gave the exporter's frame ranges. A first assembly
+lit the mirrored instances with the scene's lights and came out brighter
+than the game (the reflected colour, recovered from the blend, averaged 89
+levels against 72, with a wider spread): the game lights the character
+before mirroring it, so its front, turned away from the camera lights,
+stays dim. With mirrored lights the reflection averages 68 levels
+(quartiles 62–73 against the game's 67–77), and Fiona's mirrored hand
+meets the real one on the glass where the game puts it. In EV0007 and
+EV0018 the effect is live but changes nothing visible in the frames
+checked, in the game or the assembly.
+
+### Character shadows
+
+Pointing the shadow object's draw method at a stub (EV0007, held) removed
+the floor and bed shadows and nothing else; zeroing each room light's
+intensity in turn showed that only light 3 (the fireplace lamp) casts
+Debilitas's, although light 4 is also in range. The darkening measured
+on the floor (0.735 at frame 900, 0.70 at frame 300) is the formula in
+FORMATS.md applied to the finished picture. The assembly gives 0.732 at
+frame 900 with the shadow in the same place and of the same size (21,600
+pixels against 22,500); a first version that darkened before the tint gave
+0.833, and one that cast from a point light at the lamp darkened the walls
+and the pillar the game leaves alone. Unlimited volumes also covered the
+front of the bed and the floor beyond it at frame 300, Fiona's shadow fell
+on the window glass in EV0005 frame 2053 and on the window frame at 1750,
+where the game shows none (her shadow is active there, alpha 24.6). The
+game leaves out what the room hides: with translucent faces dropped from
+the shadow layers and the room tested for visibility from a point 0.8 of
+the way from the bone to the light (from the bone itself, the sloping
+bedcover faced away; from the lamp, the fireplace hid the near floor the
+game shades at frame 900), the bed's front, the floor beyond it and both
+EV0005 shadows go, the bed-top patch, the strip down its side and the
+floor patch beside Debilitas stay (2,700–3,200 pixels against 5,200: the
+game's patches are somewhat larger), and frame 900 is unchanged (0.733).
+In EV0014 the first version drew Fiona's arm on the tablecloth (frame 400)
+where the game shows nothing: the shadow objects there store alphas of 3
+and 6, and editing EV0007's lamp showed that the game draws no shadow at 7
+or less, so the assembly now applies that threshold (EV0014 frames 400 and
+1000 then have no shadow, as in the game; the EV0007 and EV0005 frames are
+unchanged).
+
 ### Transparency rules
 
 When the per-triangle transparency rules were introduced (see
@@ -285,16 +356,17 @@ foliage, which the old rules drew with dark sorting bands.
   (matched at half the range). In EV0002 the room lights are dimmed to a tenth,
   so it hardly matters there; Daniella in frame 1299 is 12 % brighter than in
   the game.
+* **Character shadows are approximate in extent.** The game's rule for
+  where a shadow volume stops was not decoded; the assembly's visibility
+  test reproduces EV0007 frames 300 and 900 and EV0005, with somewhat
+  smaller patches at frame 300 (see *Character shadows* above);
+  `--no-character-shadows` leaves them out.
 * **Optional room objects.** Some objects are switched on and off by the
   rooms' event scripts (command 0x4C), which the exporter does not read yet;
   the exports show all of them (for example a second moon and early broken
   glass in EV0018). They are marked so they can be hidden. In DE000C a glow
   panel in group 27 (`ST_00C_glow_sel027`) covers the stained-glass window
   the game shows.
-* **Time of day in the movie gallery.** `--time-of-day gallery` assumes the
-  gallery clears the story flags for every event (true for EV0002 and the
-  first area's warm rooms), but the gallery shows EV0014 in room 0x11's
-  night look, which the story uses there.
 * **The first second of a cutscene's physics** depends on the state the
   characters bring from gameplay, which a cutscene file does not contain.
 * **Debilitas' physics** differs by about 1 cm, because the game poses his

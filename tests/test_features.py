@@ -172,6 +172,31 @@ class ModelAndSceneTests(unittest.TestCase):
         from hgexport.export.cutscene import movie_alpha_key
         self.assertEqual(movie_alpha_key("DE100B"), ([16, 255], "from DE000B (not in the movie gallery)"))
 
+    def test_reflections(self):
+        """Room 0x31's window reflection (read from the room's code) in the stage export, and EV0005's
+        live range (cut 9, measured in the gallery) in the cutscene's extras."""
+        from hgexport.export.cutscene import export_event
+        from hgexport.export.reflection import event_reflections, room_reflections
+        from hgexport.export.stage import StageOptions, export_stage
+        window = room_reflections("ST_031", 0.1)
+        self.assertEqual([(q["slot"], q["strength"], q["horizontal"]) for q in window], [(27, 64, False)])
+        self.assertEqual(window[0]["corners"][0], [0.0491, 2.2, 6.9502])
+        self.assertEqual([q["slot"] for q in room_reflections("ST_021", 0.1)], [26, 27])
+        self.assertEqual(room_reflections("ST_011", 0.1), [])
+        self.assertEqual(event_reflections("EV0002"), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "st.glb"
+            export_stage(DATA / "ST_030" / "ST_031.PAC", out, StageOptions())
+            g = Gltf(out).json
+            root = g["nodes"][g["scenes"][0]["nodes"][0]]
+            self.assertEqual(root["extras"]["room_effects"]["reflections"], window)
+            out = Path(tmp) / "ev.glb"
+            export_event(DATA / "EV0005", out)
+            nodes = Gltf(out).json["nodes"]
+            refl = next(n["extras"]["reflections"] for n in nodes if "reflections" in n.get("extras", {}))
+            self.assertEqual(refl, event_reflections("EV0005"))
+            self.assertEqual(refl, [{"slot": 27, "frames": [[2006, 2084]]}])
+
     def test_shadow_volumes(self):
         from hgexport.export.character import export_shadow_volumes
         from hgexport.formats.shadow import parse_shadow_volumes, pck_bytes
@@ -397,7 +422,7 @@ class ModelAndSceneTests(unittest.TestCase):
         self.assertEqual(cutscene_hidden_parts("HEW_000", "EV0002"), ())
 
     def test_room_look_and_glow_geometry(self):
-        from hgexport.export.look import cutscene_story_state, room_look, room_variants, tint_grade
+        from hgexport.export.look import cutscene_story_state, gallery_state, room_look, room_variants, tint_grade
         from hgexport.export.stage import StageOptions, export_stage
         from hgexport.formats.roomdata import parse_room_effects
         from hgexport.formats.stage import parse_pac
@@ -409,6 +434,18 @@ class ModelAndSceneTests(unittest.TestCase):
         self.assertEqual(room_look(fx, variants, cutscene_story_state("EV0002"))["tint"]["colors"], warm)
         self.assertEqual(room_look(fx, variants, cutscene_story_state("EV0007"))["tint"], fx["tint"])
         self.assertEqual(room_look(fx, variants, None)["tint"], fx["tint"])
+        # the gallery runs no enter scripts: only the replay script's warm tint (EV0002, not EV0007)
+        self.assertEqual(room_look(fx, variants, gallery_state("EV0002"))["tint"]["colors"], warm)
+        self.assertEqual(room_look(fx, variants, gallery_state("EV0007"))["tint"], fx["tint"])
+        ev14 = room_variants("ST_011")
+        self.assertEqual(room_look({"tint": "night"}, ev14, gallery_state("EV0014"))["tint"], "night")
+        self.assertEqual(room_look({"bloom": "own"}, room_variants("ST_000"), gallery_state("DE0003"))["bloom"],
+                         {"color": [128, 192, 242, 170], "mode": 0})
+        # EV0033's story script sets its look before the cutscene's first frame
+        ev33 = room_look({"tint": "own"}, room_variants("ST_035"), cutscene_story_state("EV0033"))
+        self.assertEqual(ev33["tint"]["colors"], [[68, 78, 108, 100], [102, 108, 96, 70]])
+        self.assertEqual(room_look({"tint": "own"}, room_variants("ST_035"), cutscene_story_state("EV0031"))["tint"],
+                         "own")
         # room 0x0C: the second pass's glow buffer clips, so a flat 0.23 rises to 0.426 in red
         hall = {"colors": [[102, 116, 160, 116], [74, 86, 96, 138]]}
         self.assertAlmostEqual(tint_grade(hall, 0.23)[0], 0.4258, places=3)
@@ -418,7 +455,8 @@ class ModelAndSceneTests(unittest.TestCase):
             export_stage(DATA / "ST_020" / "ST_021.PAC", out, StageOptions(emissive_glow=4.0))
             g = Gltf(out).json
             root = g["nodes"][g["scenes"][0]["nodes"][0]]
-            self.assertEqual(root["extras"]["room_effects"]["script_variants"][0]["when"], {"story_flag_clear": 1})
+            whens = [v["when"] for v in root["extras"]["room_effects"]["script_variants"]]
+            self.assertEqual(whens, [{"gallery_events": ["EV0002", "EV0003"]}, {"story_flag_clear": 1}])
             engine = root["extras"]["room_effects"]["engine_look"]
             self.assertEqual(sorted(engine), ["night", "warm"])
             self.assertEqual(len(engine["night"]["grade"]), 33)

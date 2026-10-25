@@ -32,6 +32,16 @@ to effect 0x1F) and the bloom (command 0x9B) when a room is entered, under a
 story condition. The rooms' own tints are the night look; the variants below
 are a warm look used at the start of the story. The values were read from the
 rooms' enter scripts.
+
+The script that plays a cutscene can also set them, before the cutscene or
+right after its wait for the cutscene to start (still before its first
+frame): EV0033's story script does. The movie gallery (room 0x37) switches on
+the entry (progress variable 0x2A) to the event's room (command 0x3A) and
+runs one of that room's actions (command 0x92, a shared switch at 0x3D6C18):
+a replay script that plays only that cutscene. The rooms' enter scripts do
+not run there, so the gallery shows each room's own look, changed only by
+what its replay script sets (the warm tint in eleven events of the first
+area, the blue bloom in DE0003 and DE0011, EV0033's look).
 """
 from __future__ import annotations
 
@@ -39,21 +49,38 @@ _WARM = {"colors": [[132, 96, 60, 80], [36, 42, 42, 70]], "mode": 0}
 _WARM_DEEP = {"colors": [[172, 96, 38, 80], [25, 31, 18, 128]], "mode": 0}
 _BLUE_BLOOM = {"color": [128, 192, 242, 170], "mode": 0}
 
-# condition: story flag n not set yet / story phase variable 0x2E == v
+_EV0033 = {"tint": {"colors": [[68, 78, 108, 100], [102, 108, 96, 70]], "mode": 0},
+           "bloom": {"color": [176, 144, 200, 186], "mode": 0}}
+
+# condition: story flag n not set yet / story phase variable 0x2E == v (enter
+# scripts, so story only); story_events / gallery_events: the script that
+# plays one of these events in the story / the gallery's replay script
 _EARLY = {"story_flag_clear": 2}
+
+# Events whose gallery replay script sets the warm tint (room -> events).
+_GALLERY_WARM = {0x09: ["DE001B", "DE0010"], 0x0F: ["EV0004"], 0x12: ["DE000F"], 0x20: ["DE000E"],
+                 0x21: ["EV0002", "EV0003"], 0x23: ["DE0000"], 0x24: ["DE0001", "DE0002"]}
 
 
 def _variants() -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
+
+    def add(room, variant):
+        out.setdefault(f"ST_{room:03X}", []).append(variant)
+    for room, events in _GALLERY_WARM.items():
+        add(room, {"name": "warm", "when": {"gallery_events": events}, "tint": _WARM})
+    add(0x25, {"name": "warm", "when": {"gallery_events": ["DE000A"]}, "tint": _WARM_DEEP})
+    add(0x00, {"name": "blue_bloom", "when": {"gallery_events": ["DE0003", "DE0011"]}, "bloom": _BLUE_BLOOM})
+    add(0x35, {"name": "EV0033", "when": {"story_events": ["EV0033"], "gallery_events": ["EV0033"]}, **_EV0033})
     for room in (0x09, 0x0F, 0x10, 0x11, 0x12, 0x14, 0x20, 0x22, 0x23, 0x24):
-        out[f"ST_{room:03X}"] = [{"name": "warm", "when": _EARLY, "tint": _WARM}]
+        add(room, {"name": "warm", "when": _EARLY, "tint": _WARM})
     for room in (0x01, 0x13, 0x25, 0x2A, 0x2B, 0x2D):
-        out[f"ST_{room:03X}"] = [{"name": "warm", "when": _EARLY, "tint": _WARM_DEEP}]
-    out["ST_000"] = [{"name": "warm", "when": _EARLY, "tint": _WARM_DEEP, "bloom": _BLUE_BLOOM}]
-    out["ST_021"] = [{"name": "warm", "when": {"story_flag_clear": 1}, "tint": _WARM}]
+        add(room, {"name": "warm", "when": _EARLY, "tint": _WARM_DEEP})
+    add(0x00, {"name": "warm", "when": _EARLY, "tint": _WARM_DEEP, "bloom": _BLUE_BLOOM})
+    add(0x21, {"name": "warm", "when": {"story_flag_clear": 1}, "tint": _WARM})
     for room in range(0xE0, 0xE6):
-        out[f"ST_{room:03X}"] = [{"name": "warm", "when": {"story_phase": 1}, "tint": _WARM}]
-    out["ST_0E9"] = [{"name": "warm", "when": {"story_phase": 1}, "tint": _WARM_DEEP, "bloom": _BLUE_BLOOM}]
+        add(room, {"name": "warm", "when": {"story_phase": 1}, "tint": _WARM})
+    add(0xE9, {"name": "warm", "when": {"story_phase": 1}, "tint": _WARM_DEEP, "bloom": _BLUE_BLOOM})
     return out
 
 
@@ -61,15 +88,17 @@ ROOM_VARIANTS = _variants()
 
 # Story flag 2 is set when Fiona first leaves room 0x21 after EV0002 (its
 # action script 8); flag 1 by an examine event in room 0x12 (action script 4).
-# Only these cutscenes play before them; the movie gallery also sends them
-# the warm tint explicitly (room 0x37's gallery scripts).
+# Only these cutscenes play before them.
 _STORY_START = {"EV0002", "EV0003"}
 
 LOOK_NOTE = ("room_effects.tint / .bloom: the room's own screen look (RGBA, 128 = 1.0; the effects use alpha/2 "
              "as strength), drawn in display values over the 3D picture (export/look.py, docs/FORMATS.md "
              "'Screen look'). script_variants: replacements the room's enter script makes under a story "
              "condition (story_flag_clear: n = before story flag n is set; story_phase: v = phase variable "
-             "0x2E is v). The room's own values are the night look. engine_look: the same for engines (the tint "
+             "0x2E is v; these enter-script conditions hold only in the story) or for some events "
+             "(story_events: the script that plays the event in the story sets it; gallery_events: the "
+             "movie gallery's replay script does - the gallery shows the room's own values otherwise). "
+             "The room's own values are the night look. engine_look: the same for engines (the tint "
              "as a grade curve with a detail gain, and a scene-linear bloom of the emissive lamps), for the night "
              "look and each variant (look.engine_look).")
 
@@ -81,11 +110,23 @@ def room_variants(stage_name: str) -> list[dict]:
 def cutscene_story_state(event: str) -> dict:
     """The story flags (1, 2) and phase a cutscene plays with in the story."""
     if event.upper() in _STORY_START:
-        return {"story_flags": [], "story_phase": 0}
-    return {"story_flags": [1, 2], "story_phase": 0}
+        return {"event": event.upper(), "story_flags": [], "story_phase": 0}
+    return {"event": event.upper(), "story_flags": [1, 2], "story_phase": 0}
+
+
+def gallery_state(event: str) -> dict:
+    """The state the movie gallery plays a cutscene in."""
+    return {"event": event.upper(), "gallery": True}
 
 
 def condition_holds(when: dict, state: dict) -> bool:
+    event = state.get("event")
+    if state.get("gallery"):
+        return event in when.get("gallery_events", ())
+    if "story_events" in when:
+        return event in when["story_events"]
+    if "story_flag_clear" not in when and "story_phase" not in when:
+        return False                    # gallery only
     flags = set(state.get("story_flags", []))
     if "story_flag_clear" in when and when["story_flag_clear"] in flags:
         return False

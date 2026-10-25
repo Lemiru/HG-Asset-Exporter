@@ -187,10 +187,18 @@ def _event_extras(event_dir: Path, timeline: EventTimeline, report: dict) -> dic
     if movie:
         extras["movie"] = movie
     from .look import cutscene_story_state
+    from .reflection import event_reflections
     extras["story_state"] = cutscene_story_state(event_dir.name)
-    extras["story_state_note"] = ("story flags and phase when the cutscene plays in the story; they pick the "
-                                  "rooms' script_variants (room_effects) - the movie gallery plays everything "
-                                  "with no story flags set")
+    reflections = event_reflections(event_dir.name)
+    if reflections:
+        extras["reflections"] = reflections
+        extras["reflections_note"] = ("[{slot, frames: [[first, last], ...]}]: event frames in which the room's "
+                                      "reflection effect in that slot is live (room_effects.reflections of the "
+                                      "room export), measured in the movie gallery")
+    extras["story_state_note"] = ("story flags and phase when the cutscene plays in the story; with the event "
+                                  "they pick the rooms' script_variants (room_effects). The movie gallery runs "
+                                  "no enter scripts: it shows the room's own look and the variants whose "
+                                  "gallery_events name the event")
     return extras
 
 
