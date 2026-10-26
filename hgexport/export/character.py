@@ -33,7 +33,7 @@ class CharacterOptions:
     unlit: bool = False
     extra_banks: list[tuple[str, MotionBank]] = field(default_factory=list)
     bone_prefix: str = ""
-    root_motion: bool = False           # integrate controller -1 onto a motion node above the skeleton
+    root_motion: bool = True            # controller -1 as the movement of a ground-level "root" joint
     separate_parts: bool = False        # one object per PCK submesh (toggle anything in a DCC/engine)
     accessories: bool = True            # known optional accessories as separate objects
     exclude_parts: tuple[str, ...] = ()  # accessory/part names to leave out entirely
@@ -228,7 +228,8 @@ class CharacterBuilder:
     def _node(self, node: dict, top: bool) -> int:
         if top and self.opts.root_motion and "extras" in node and "bone_index" in node["extras"]:
             if getattr(self, "motion_node", None) is None:
-                self.motion_node = self.b.node({"name": f"{self.opts.bone_prefix}{self.model.name}_motion"},
+                # the ground-level root joint that carries the clips' movement through the room
+                self.motion_node = self.b.node({"name": f"{self.opts.bone_prefix}root"},
                                                root=self.parent_node is None)
                 if self.parent_node is not None:
                     self.b.add_child(self.parent_node, self.motion_node)
@@ -437,11 +438,17 @@ class CharacterBuilder:
         makes importers build an armature, so animation-only files bind by
         bone name to the character exported on its own."""
         if getattr(self, "skin_index", None) is None and self.bone_nodes:
+            joints, ibms = self.bone_nodes, self.ibms
+            top = self.root_nodes[0] if len(self.root_nodes) == 1 else self.bone_nodes[0]
+            if getattr(self, "motion_node", None) is not None:
+                # the ground-level root joint goes last, so vertex joint indices stay the bone indices
+                identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                joints, ibms, top = joints + [self.motion_node], ibms + [identity], self.motion_node
             self.skin_index = self.b.skin({
                 "name": name or f"{self.model.name}_skeleton",
-                "joints": self.bone_nodes,
-                "inverseBindMatrices": self.b.mat4s(self.ibms),
-                "skeleton": self.root_nodes[0] if len(self.root_nodes) == 1 else self.bone_nodes[0],
+                "joints": joints,
+                "inverseBindMatrices": self.b.mat4s(ibms),
+                "skeleton": top,
             })
         return getattr(self, "skin_index", None)
 
@@ -920,7 +927,7 @@ def export_shadow_volumes(pck: Path | str, out: Path | str, opts: CharacterOptio
     if not volumes:
         return {"shadow_volumes": 0}
     model = parse_pck(pck)
-    cb = CharacterBuilder(model, None, CharacterOptions(scale=opts.scale, mesh=False))
+    cb = CharacterBuilder(model, None, CharacterOptions(scale=opts.scale, mesh=False, root_motion=opts.root_motion))
     cb.b.doc["asset"]["extras"] = {"source": pck.name, "shadow_volumes_only": True,
                                    "base_model": f"characters/{pck.parent.name}/{pck.stem}{Path(out).suffix}"}
     cb.add_skeleton()

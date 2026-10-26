@@ -384,13 +384,23 @@ class ModelAndSceneTests(unittest.TestCase):
         from hgexport.export.character import CharacterOptions, export_character
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "fin.glb"
-            export_character(DATA / "O_FIN" / "FIN_000.PCK", out, CharacterOptions(root_motion=True))
+            export_character(DATA / "O_FIN" / "FIN_000.PCK", out)   # on by default
             g = Gltf(out)
-            motion = next(i for i, n in enumerate(g.json["nodes"]) if n["name"].endswith("_motion"))
+            motion = next(i for i, n in enumerate(g.json["nodes"]) if n["name"] == "root")
+            skin = g.json["skins"][0]
+            self.assertEqual(skin["skeleton"], motion)    # a joint of the skin, parent of the old top bone
+            self.assertEqual(skin["joints"][-1], motion)
             clip = next(a for a in g.json["animations"] if a["name"] == "010")
             ch = next(c for c in clip["channels"] if c["target"] == {"node": motion, "path": "translation"})
             end = g.accessor(clip["samplers"][ch["sampler"]]["output"])[-1]
             self.assertGreater(end[2], 1.0)
+            # the walk (0x200): 32 frames of 0.4499..0.4781 game units forward, 0.1 m each
+            walk = next(a for a in g.json["animations"] if "0x200" in a.get("extras", {}).get("resource_ids", []))
+            ch = next(c for c in walk["channels"] if c["target"] == {"node": motion, "path": "translation"})
+            pos = g.accessor(walk["samplers"][ch["sampler"]]["output"])
+            self.assertAlmostEqual(pos[1][2], 0.04767, places=4)
+            export_character(DATA / "O_FIN" / "FIN_000.PCK", out, CharacterOptions(root_motion=False))
+            self.assertFalse(any(n["name"] == "root" for n in Gltf(out).json["nodes"]))
 
     def test_obstacle_curve(self):
         from hgexport.formats.stage import parse_curve_bank

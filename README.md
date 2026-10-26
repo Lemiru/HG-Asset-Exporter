@@ -171,9 +171,20 @@ their number in the game's animation table (`003`, `017`). Animations from
 the character's extra animation files get the file name in front
 (`HEW_100_002`). Some animations come with a separate overlay that moves
 only a few bones (ears, tail, mouth); when it cannot be merged with the main
-animation it becomes its own clip (`017_layer3`). Clips play in place; add
-`--root-motion` to get the movement through the room that the game applies
-while walking or running.
+animation it becomes its own clip (`017_layer3`).
+
+**Root motion.** The game moves characters by their animations: each
+animation stores how far it turns and steps on every frame, and that is
+where walking and running speeds come from (Fiona's walk 0.46 units a frame,
+1.4 m/s; her run 1.15, 3.5 m/s). The export puts this movement on a
+ground-level `root` bone, the new top bone of the skeleton, so a walk clip
+carries the character forward at the game's speed. Point your engine's root
+motion at that bone, or add `--no-root-motion` for clips that play in
+place. Cutscene
+files never have it: there the actors' positions come from the cutscene.
+The game also changes the step while playing (slopes, blends between the
+normal, scared and hurt walks, turning); those rules are not part of the
+clips.
 
 **Animation variants.** Files such as `FIN_001`…`FIN_006` contain the same
 model as `FIN_000` and differ only in a few animations: the ones Fiona plays

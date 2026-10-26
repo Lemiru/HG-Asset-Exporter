@@ -19,7 +19,8 @@ def cmd_all(a) -> int:
     cats = set(a.only_category or CATEGORIES)
     manifest = run(Path(a.data), Path(a.out), cats, scale=a.scale, fmt=a.format, workers=a.workers, only=a.filter,
                    embed_cutscene_models=a.embed_cutscene_models, specular=a.specular,
-                   emissive_glow=a.emissive_glow or 0.0, light_units=a.light_units)
+                   emissive_glow=a.emissive_glow or 0.0, light_units=a.light_units,
+                   root_motion=not a.no_root_motion)
     print(json.dumps(manifest["counts"]), "failures:", manifest["failures"])
     return 1 if manifest["failures"] else 0
 
@@ -35,7 +36,7 @@ def cmd_character(a) -> int:
     opts = CharacterOptions(scale=a.scale, animations=not a.no_animations, mesh=not a.animations_only,
                             morphs=not a.no_morphs, game_alpha=a.game_alpha, bleed=a.bleed,
                             specular=a.specular, texture_variant=a.textures, unlit=a.unlit, extra_banks=banks,
-                            root_motion=a.root_motion, separate_parts=a.separate_parts,
+                            root_motion=not a.no_root_motion, separate_parts=a.separate_parts,
                             shadow_volumes=a.shadow_volumes, feet=not a.no_foot_contacts,
                             hand_poses=not a.no_hand_poses)
     if a.variant_of:
@@ -199,6 +200,11 @@ def main(argv: list[str] | None = None) -> int:
                             "Blender's importer and exposure-based renderers (Unity HDRP); unitless: 128 = 1, for "
                             "engines that use the value as it is (Godot, Unity URP)")
 
+    def root_motion(p):
+        p.add_argument("--no-root-motion", action="store_true",
+                       help="characters: clips play in place, without the ground-level 'root' bone that "
+                            "carries each clip's movement through the room (walk and run speeds)")
+
     p = sub.add_parser("all", help="export everything from an extracted DATA.CVM folder")
     p.add_argument("data")
     p.add_argument("out")
@@ -212,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--emissive-glow", type=float, nargs="?", const=4.0, metavar="STRENGTH",
                    help="rooms: make the glow geometry (lamps, candles; drawn into the game's bloom) emissive at this strength, default 4, for engines whose bloom works from emission (KHR_materials_emissive_strength; off by default)")
     light_units(p)
+    root_motion(p)
     p.add_argument("--embed-cutscene-models", action="store_true",
                    help="cutscene files include actor meshes and room geometry (default: animation, camera "
                         "and props only, referencing the character/stage exports by name)")
@@ -247,8 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="leave out the per-clip foot contact intervals / foot points (clip extras)")
     p.add_argument("--no-hand-poses", action="store_true",
                    help="no MRK-driven hand pose weights / extras in the clips (Fiona, Debilitas)")
-    p.add_argument("--root-motion", action="store_true",
-                   help="move a motion node above the skeleton by the clips' authored root motion")
+    root_motion(p)
     common(p)
     p.set_defaults(func=cmd_character)
 

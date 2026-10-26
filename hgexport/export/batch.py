@@ -30,14 +30,15 @@ def family_banks(pck: Path) -> list[tuple[str, Path]]:
     return out
 
 
-def _job_character(pck: str, out: str, scale: float, fmt: str, specular: bool = False) -> dict:
+def _job_character(pck: str, out: str, scale: float, fmt: str, specular: bool = False,
+                   root_motion: bool = True) -> dict:
     from .character import CharacterOptions, export_animation_variant, export_character, same_rig, variant_base
     p = Path(pck)
     model = parse_pck(p)
     base = variant_base(p)
     if base is not None and same_rig(model, parse_pck(base)):
         # X_001.. share mesh and skeleton with X_000: only the differing clips.
-        return export_animation_variant(p, base, Path(out), CharacterOptions(scale=scale))
+        return export_animation_variant(p, base, Path(out), CharacterOptions(scale=scale, root_motion=root_motion))
     banks, skipped = [], []
     for label, path in family_banks(p):
         try:
@@ -50,7 +51,8 @@ def _job_character(pck: str, out: str, scale: float, fmt: str, specular: bool = 
             skipped.append(f"{path.name}: targets bone slot {max(targets)} beyond palette {len(model.palette)}")
             continue
         banks.append((label, bank))
-    rep = export_character(p, Path(out), CharacterOptions(scale=scale, extra_banks=banks, specular=specular))
+    rep = export_character(p, Path(out), CharacterOptions(scale=scale, extra_banks=banks, specular=specular,
+                                                          root_motion=root_motion))
     rep["mtn_banks"] = [label for label, _b in banks]
     # the game's per-part shine as grey masks next to the textures (export/shine.py)
     from .shine import export_shine_masks
@@ -59,7 +61,8 @@ def _job_character(pck: str, out: str, scale: float, fmt: str, specular: bool = 
         rep["shine_masks"] = masks
     from .character import export_shadow_volumes
     shadow = Path(out).with_name(Path(out).stem + "_shadow" + Path(out).suffix)
-    rep["shadow_file"] = export_shadow_volumes(p, shadow, CharacterOptions(scale=scale)).get("shadow_volumes", 0)
+    rep["shadow_file"] = export_shadow_volumes(p, shadow, CharacterOptions(scale=scale, root_motion=root_motion)).get(
+        "shadow_volumes", 0)
     if skipped:
         rep.setdefault("warnings", []).extend(skipped)
     return rep
@@ -150,7 +153,7 @@ def _job_movie(sfd: str, out_dir: str) -> dict:
 
 def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, only: str | None,
          embed_cutscene_models: bool = False, specular: bool = False,
-         emissive_glow: float = 0.0, light_units: str = "physical") -> list[tuple]:
+         emissive_glow: float = 0.0, light_units: str = "physical", root_motion: bool = True) -> list[tuple]:
     ext = "." + fmt
     jobs: list[tuple] = []
 
@@ -165,7 +168,7 @@ def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, on
                 stem = f"{pck.stem}_{label}" if label else pck.stem
                 jobs.append(("characters", pck, _job_character,
                              (str(pck), str(out / "characters" / pck.parent.name / (stem + ext)), scale, fmt,
-                              specular)))
+                              specular, root_motion)))
     if "stages" in categories:
         for pac in sorted(data.glob("ST_*/*.PAC")):
             if want(pac):
@@ -238,10 +241,12 @@ def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, on
 
 def run(data: Path, out: Path, categories: set[str] | None = None, *, scale: float = 0.1, fmt: str = "glb",
         workers: int | None = None, only: str | None = None, embed_cutscene_models: bool = False,
-        specular: bool = False, emissive_glow: float = 0.0, light_units: str = "physical", log=print) -> dict:
+        specular: bool = False, emissive_glow: float = 0.0, light_units: str = "physical", root_motion: bool = True,
+        log=print) -> dict:
     categories = set(categories or CATEGORIES)
     out.mkdir(parents=True, exist_ok=True)
-    jobs = plan(data, out, categories, scale, fmt, only, embed_cutscene_models, specular, emissive_glow, light_units)
+    jobs = plan(data, out, categories, scale, fmt, only, embed_cutscene_models, specular, emissive_glow, light_units,
+                root_motion)
     log(f"{len(jobs)} export jobs")
     results: dict[str, list] = {c: [] for c in categories}
     failures = 0

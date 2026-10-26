@@ -374,7 +374,7 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
         group = b.node({"name": label, "extras": extras})
         b.add_child(scene_root, group)
         if opts.embed_models:
-            cb = CharacterBuilder(model, sets.get(variant), CharacterOptions(scale=s, bone_prefix=f"{label}_",
+            cb = CharacterBuilder(model, sets.get(variant), CharacterOptions(scale=s, bone_prefix=f"{label}_", root_motion=False,
                                                                                material_variants=False,
                                                                                exclude_parts=cutscene_hidden_parts(
                                                                                    model.name, timeline.name)),
@@ -383,7 +383,8 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
             cb.add_mesh()
         else:
             # Bone names as in the character export, so the actions retarget by name.
-            cb = CharacterBuilder(model, None, CharacterOptions(scale=s), builder=b, parent_node=group)
+            cb = CharacterBuilder(model, None, CharacterOptions(scale=s, root_motion=False), builder=b,
+                                  parent_node=group)
             cb.add_skeleton()
             cb.add_skin(name=label)
             if opts.face or opts.hands:

@@ -397,7 +397,7 @@ Animations run at 30 frames per second (verified against cutscene audio).
 
 | Target | Meaning | Exported as |
 | --- | --- | --- |
-| −1 | movement through the room: per-frame turn and step | `--root-motion` adds it as movement of a `<model>_motion` node |
+| −1 | movement through the room: per-frame turn and step | movement of a ground-level `root` joint, the skeleton's top bone (last in the skin's joint list, identity bind; off with `--no-root-motion`; never in cutscene files) |
 | −2, −3 | positions of the two foot bones | `foot_points` (only where they differ, see below) |
 | −4 | foot contact flags | `foot_contact` |
 | −5, −6 | Hewie's paw contacts (hind, front) | `foot_contact` |
