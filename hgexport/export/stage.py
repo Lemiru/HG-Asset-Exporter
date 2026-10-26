@@ -33,6 +33,7 @@ class StageOptions:
     cameras: bool = True           # gameplay camera rails (slot 6) as animated cameras
     navmesh: bool = False          # walkable-floor navigation mesh as an extra node
     lights: bool = True            # slot-4 character lights as KHR_lights_punctual nodes
+    light_units: str = "physical"  # glTF light intensities: "physical" (128 = 2000 lux) or "unitless" (128 = 1)
     emissive_glow: float = 0.0     # > 0: glow geometry (lamps; export/look.py) emissive at this strength
     updates_per_second: float = 30.0
 
@@ -333,11 +334,16 @@ class StageBuilder:
         b, s = self.b, self.opts.scale
         defs = b.doc.setdefault("extensions", {}).setdefault("KHR_lights_punctual", {"lights": []})["lights"]
         b.extensions_used.add("KHR_lights_punctual")
-        group = b.node({"name": f"{self.stage.name}_lights", "extras": {"note": LIGHTING_NOTE}})
+        if self.opts.light_units not in LIGHT_UNITS:
+            raise ValueError(f"light_units must be one of {', '.join(LIGHT_UNITS)}")
+        unitless = self.opts.light_units == "unitless"
+        group = b.node({"name": f"{self.stage.name}_lights",
+                        "extras": {"note": LIGHTING_NOTE, "light_units": self.opts.light_units}})
         b.add_child(root, group)
         for light in self.stage.lighting.lights:
             peak = max(light.color) or 1.0
-            full = LUX_PER_UNIT * peak * max(light.intensity, 0.0)   # the game scales RGB by intensity
+            # the game scales RGB by intensity
+            full = (1.0 / 128.0 if unitless else LUX_PER_UNIT) * peak * max(light.intensity, 0.0)
             gl = {"name": f"{self.stage.name}_light{light.index:02d}",
                   "color": [round(max(c, 0.0) / peak, 4) for c in light.color]}
             node = {"name": gl["name"], "extras": {
@@ -346,7 +352,7 @@ class StageBuilder:
             pos = [c * s for c in light.position]
             if light.directional:
                 gl["type"] = "directional"
-                gl["intensity"] = round(full, 3)                      # lux
+                gl["intensity"] = round(full, 5 if unitless else 3)   # lux (unitless: 1 = the game's 128)
                 # shines from the stored far point towards the room
                 node["rotation"] = list(look_at_quat((0.0, 0.0, 0.0), [-c for c in pos]))
                 node["extras"]["position_game_units"] = list(light.position)
@@ -355,9 +361,13 @@ class StageBuilder:
                 gl["range"] = round(light.range * s, 5)
                 # candela: inverse-square illuminance matches the game's linear
                 # falloff at a typical character distance (half the range, at
-                # most 2.5 m), so wide-range lights do not blow out nearby actors
-                d = min(light.range * s / 2, MATCH_DISTANCE)
-                gl["intensity"] = round(full * (1 - d / (light.range * s)) * d * d, 3)
+                # most 2.5 m), so wide-range lights do not blow out nearby actors;
+                # unitless, also through the range fade Godot and Unity apply
+                # ((1 - (d / range)^4)^2; Blender has none)
+                r = light.range * s
+                d = min(r / 2, MATCH_DISTANCE)
+                fade = (1 - (d / r) ** 4) ** 2 if unitless else 1.0
+                gl["intensity"] = round(full * (1 - d / r) * d * d / fade, 5 if unitless else 3)
                 node["translation"] = pos
             defs.append(gl)
             node["extensions"] = {"KHR_lights_punctual": {"light": len(defs) - 1}}
@@ -566,11 +576,15 @@ LIGHTING_NOTE = ("PAC slot 4 character lighting (the room itself is pre-lit in i
                  "lights a character with the ambient plus the 3 strongest lights enabled on the floor triangle "
                  "under it (navmesh 'light_masks'): strength = luminance x (range - distance) / range; "
                  "directional lights have no falloff. Colours are on the game's 0-255 scale (game_rgb extras) and "
-                 "scaled by game_intensity; glTF intensities assume 128 = 2000 lux: directional = that illuminance, point lights match "
+                 "scaled by game_intensity. glTF intensities (light_units extra): 'physical' assumes 128 = 2000 lux "
+                 "(Blender's importer, which divides by 683 lm/W, then shows 128 at about the texture's own value; "
+                 "exposure-based renderers such as Unity HDRP), 'unitless' 128 = 1 (Godot, Unity URP, which use the "
+                 "value as it is); directional = that illuminance, point lights match "
                  "the game's strength at half their range (at most 2.5 m) (glTF falls off with the inverse square, the "
                  "game linearly). The game multiplies the texture's display value by (ambient + lights) / 128, "
                  "so linear-light materials look brighter than the game in dim rooms; scale to taste.")
 LUX_PER_UNIT = 2000.0 / 128.0
+LIGHT_UNITS = ("physical", "unitless")
 MATCH_DISTANCE = 2.5      # metres: where point-light intensity matches the game's falloff
 
 

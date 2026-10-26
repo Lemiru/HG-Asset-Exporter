@@ -431,9 +431,12 @@ def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Pat
     4 pi^2 d^2 c / 128 (1 - d / range) W, matching the game's linear falloff
     at d = half the range (at most MATCH_DISTANCE; Blender's falls off with
     the inverse square) - and the ambient keyed into the shading group, the
-    world black. Otherwise the export's photometric scale (128 = 2000 lux)
-    and a world colour for the ambient. Either way all the room's lights are
-    used (the game picks the three strongest per character)."""
+    world black. Otherwise the export's photometric scale (128 = 2000 lux,
+    as Blender imports a physical-units room) and a world colour for the
+    ambient. Either way the energies come from the lights' game values
+    (extras), so rooms exported with either --light-units work, and all the
+    room's lights are used (the game picks the three strongest per
+    character)."""
     extras = next((n.get("extras", {}) for n in cut_json.get("nodes", [])
                    if "cut_parameters" in n.get("extras", {})), {})
     anim = (cut_json.get("animations") or [{}])[0].get("extras", {})
@@ -452,19 +455,20 @@ def apply_cut_lighting(scene, camera, cut_json: dict, room_refs: list, root: Pat
                     break
     room_lights = [o for o in scene.objects if o.type == "LIGHT" and o.parent is not None]
     base = {o.name: o.data.energy for o in room_lights}
-    if game_units:
-        for o in room_lights:
-            rgb = list(o.get("game_rgb", []))
-            if not rgb:
-                continue
-            lum = max(rgb) * max(float(o.get("game_intensity", 1.0)), 0.0)
-            o.data.color = [c / (max(rgb) or 1.0) for c in rgb]
-            if o.data.type == "POINT":
-                r = float(o.get("range_game_units", 0.0)) * UNIT
-                d = min(r / 2, MATCH_DISTANCE)
-                base[o.name] = 4 * math.pi ** 2 * d * d * lum / 128.0 * (1 - d / r) if r > 0 else 0.0
-            else:
-                base[o.name] = math.pi * lum / 128.0
+    # the physical scale against the game's: 2000 lux / 683 lm/W against pi
+    physical = 1.0 if game_units else LUX_PER_UNIT * 128.0 * WATTS_PER_LUX / math.pi
+    for o in room_lights:
+        rgb = list(o.get("game_rgb", []))
+        if not rgb:
+            continue
+        lum = max(rgb) * max(float(o.get("game_intensity", 1.0)), 0.0)
+        o.data.color = [c / (max(rgb) or 1.0) for c in rgb]
+        if o.data.type == "POINT":
+            r = float(o.get("range_game_units", 0.0)) * UNIT
+            d = min(r / 2, MATCH_DISTANCE)
+            base[o.name] = physical * 4 * math.pi ** 2 * d * d * lum / 128.0 * (1 - d / r) if r > 0 else 0.0
+        else:
+            base[o.name] = physical * math.pi * lum / 128.0
     cut_lights = []
     for k in range(2):
         data = bpy.data.lights.new(f"cut_light{k}", "SUN")

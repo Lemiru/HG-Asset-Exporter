@@ -576,7 +576,14 @@ type 0).
 882 lights in 166 rooms (795 point, 87 directional). The export assumes the
 game's full value of 128 equals 2000 lux and matches the game's linear
 falloff at half the range (at most 2.5 m), so wide lights are not too bright
-up close.
+up close. Blender's importer turns that into 128 ≈ 0.93 on a white surface
+(2000 / (683 π)); Godot and Unity URP put the glTF number straight into the
+light's energy, where 1 lights a white surface to 1, so `--light-units
+unitless` writes 128 = 1 and, for point lights, also divides by those
+engines' range fade (1 − (d / range)⁴)² at the matching distance (rendered in
+Godot 4.7: ST_011's main lamp 0.397 at 2.5 m, the game 0.398; ST_000's
+first directional light 0.227, the game 0.229). The lights group's extras
+say which units a file uses (`light_units`).
 
 ### Navigation and triggers (slots 0, 1, 2, 14, 16)
 

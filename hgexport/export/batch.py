@@ -65,12 +65,13 @@ def _job_character(pck: str, out: str, scale: float, fmt: str, specular: bool = 
     return rep
 
 
-def _job_stage(pac: str, out: str, scale: float, fmt: str, emissive_glow: float = 0.0) -> dict:
+def _job_stage(pac: str, out: str, scale: float, fmt: str, emissive_glow: float = 0.0,
+               light_units: str = "physical") -> dict:
     from .stage import StageOptions, export_stage
     from .stage import export_navmesh, export_zones
     door = Path(pac).parent.parent / "O_FIN" / "FIN_D000.MTN"
     rep = export_stage(pac, out, StageOptions(scale=scale, door_motion=door if door.is_file() else None,
-                                              emissive_glow=emissive_glow))
+                                              emissive_glow=emissive_glow, light_units=light_units))
     nav = Path(out).with_name(Path(out).stem + "_navmesh" + Path(out).suffix)
     rep["navmesh"] = export_navmesh(pac, nav, scale)
     rep["zones"] = export_zones(pac, Path(out).with_name(Path(out).stem + "_zones" + Path(out).suffix), scale)
@@ -149,7 +150,7 @@ def _job_movie(sfd: str, out_dir: str) -> dict:
 
 def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, only: str | None,
          embed_cutscene_models: bool = False, specular: bool = False,
-         emissive_glow: float = 0.0) -> list[tuple]:
+         emissive_glow: float = 0.0, light_units: str = "physical") -> list[tuple]:
     ext = "." + fmt
     jobs: list[tuple] = []
 
@@ -170,7 +171,7 @@ def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, on
             if want(pac):
                 jobs.append(("stages", pac, _job_stage,
                              (str(pac), str(out / "stages" / pac.parent.name / (pac.stem + ext)), scale, fmt,
-                              emissive_glow)))
+                              emissive_glow, light_units)))
     if "cutscenes" in categories:
         for dh in sorted(data.glob("*/*.DH")):
             ev = dh.parent
@@ -237,10 +238,10 @@ def plan(data: Path, out: Path, categories: set[str], scale: float, fmt: str, on
 
 def run(data: Path, out: Path, categories: set[str] | None = None, *, scale: float = 0.1, fmt: str = "glb",
         workers: int | None = None, only: str | None = None, embed_cutscene_models: bool = False,
-        specular: bool = False, emissive_glow: float = 0.0, log=print) -> dict:
+        specular: bool = False, emissive_glow: float = 0.0, light_units: str = "physical", log=print) -> dict:
     categories = set(categories or CATEGORIES)
     out.mkdir(parents=True, exist_ok=True)
-    jobs = plan(data, out, categories, scale, fmt, only, embed_cutscene_models, specular, emissive_glow)
+    jobs = plan(data, out, categories, scale, fmt, only, embed_cutscene_models, specular, emissive_glow, light_units)
     log(f"{len(jobs)} export jobs")
     results: dict[str, list] = {c: [] for c in categories}
     failures = 0

@@ -347,7 +347,11 @@ to within a millimetre in every visible shot.
 characters' transparent materials write depth (or use dithered or
 alpha-to-coverage transparency), draw the rooms' transparent materials after
 the opaque ones without depth writes, and switch off shadows from the room
-lights on characters.
+lights on characters. Export the rooms with `--light-units unitless` for
+Godot and Unity's URP, which use glTF light intensities as they are (the
+default physical units are about 2000 times too bright there); this script
+works out its light energies from the game values, so it takes rooms in
+either units.
 
 ---
 

@@ -19,7 +19,7 @@ def cmd_all(a) -> int:
     cats = set(a.only_category or CATEGORIES)
     manifest = run(Path(a.data), Path(a.out), cats, scale=a.scale, fmt=a.format, workers=a.workers, only=a.filter,
                    embed_cutscene_models=a.embed_cutscene_models, specular=a.specular,
-                   emissive_glow=a.emissive_glow or 0.0)
+                   emissive_glow=a.emissive_glow or 0.0, light_units=a.light_units)
     print(json.dumps(manifest["counts"]), "failures:", manifest["failures"])
     return 1 if manifest["failures"] else 0
 
@@ -54,6 +54,7 @@ def cmd_stage(a) -> int:
                                     objects=not a.no_objects, unlit=not a.lit,
                                     animations=not a.no_animations, lights=not a.no_lights,
                                     game_alpha=a.game_alpha, bleed=a.bleed, emissive_glow=a.emissive_glow or 0.0,
+                                    light_units=a.light_units,
                                     door_motion=Path(a.door_motion) if a.door_motion else _default_door(a.pac),
                                     extra_door_motion=_extra_doors(a)))
     print(json.dumps(rep, indent=1))
@@ -192,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--format", choices=("glb", "gltf"), default=None,
                        help="output format when OUT has no extension (default glb)")
 
+    def light_units(p):
+        p.add_argument("--light-units", choices=("physical", "unitless"), default="physical",
+                       help="rooms: glTF light intensities; physical (default): the game's 128 = 2000 lux, for "
+                            "Blender's importer and exposure-based renderers (Unity HDRP); unitless: 128 = 1, for "
+                            "engines that use the value as it is (Godot, Unity URP)")
+
     p = sub.add_parser("all", help="export everything from an extracted DATA.CVM folder")
     p.add_argument("data")
     p.add_argument("out")
@@ -204,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
                         "written to textures/<folder>/<model>_mNN_shine.png)")
     p.add_argument("--emissive-glow", type=float, nargs="?", const=4.0, metavar="STRENGTH",
                    help="rooms: make the glow geometry (lamps, candles; drawn into the game's bloom) emissive at this strength, default 4, for engines whose bloom works from emission (KHR_materials_emissive_strength; off by default)")
+    light_units(p)
     p.add_argument("--embed-cutscene-models", action="store_true",
                    help="cutscene files include actor meshes and room geometry (default: animation, camera "
                         "and props only, referencing the character/stage exports by name)")
@@ -253,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lit", action="store_true", help="lit materials instead of unlit (lighting is baked)")
     p.add_argument("--no-animations", action="store_true", help="no atlas/door/fan/shape clips")
     p.add_argument("--no-lights", action="store_true", help="leave out the room's character lights (slot 4)")
+    light_units(p)
     p.add_argument("--emissive-glow", type=float, nargs="?", const=4.0, metavar="STRENGTH",
                    help="rooms: make the glow geometry (lamps, candles; drawn into the game's bloom) emissive at this strength, default 4, for engines whose bloom works from emission (KHR_materials_emissive_strength; off by default)")
     p.add_argument("--bleed", action="store_true", help="fill the colour under fully transparent texels from their visible neighbours (removes the dark "

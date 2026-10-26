@@ -291,6 +291,16 @@ class ModelAndSceneTests(unittest.TestCase):
             self.assertEqual([l["type"] for l in doc["extensions"]["KHR_lights_punctual"]["lights"]],
                              ["directional", "directional", "point", "point"])
             self.assertEqual(validate(out), [])
+            # unitless: 128 = 1 (Godot, Unity URP); the physical scale is 2000 lux per 128
+            export_stage(DATA / "ST_000" / "ST_000.PAC", out, StageOptions(light_units="unitless"))
+            unitless = Gltf(out).json["extensions"]["KHR_lights_punctual"]["lights"]
+            self.assertAlmostEqual(unitless[0]["intensity"] * 2000.0, doc["extensions"]["KHR_lights_punctual"]
+                                   ["lights"][0]["intensity"], delta=0.01)
+            point = lit.lights[2]
+            r, d = point.range * 0.1, min(point.range * 0.1 / 2, 2.5)
+            # a white surface at d gets the game's strength through Godot's and URP's range fade
+            self.assertAlmostEqual(unitless[2]["intensity"] * (1 - (d / r) ** 4) ** 2 / (d * d),
+                                   max(point.color) * point.intensity / 128 * (1 - d / r), places=4)
 
     def test_wall_edges(self):
         from hgexport.export.stage import export_navmesh

@@ -216,8 +216,14 @@ example `FIN_000.TEX#1`, which is `textures/O_FIN/FIN_000_1.png`.
 **Lights.** The game lights only characters, using the room's ambient colour
 plus up to 16 lights per room (it picks the three strongest for where the
 character stands). They are exported as glTF punctual lights under
-`<room>_lights`; brightness assumes the game's full value equals 2000 lux,
-so adjust to taste. The game applies the light to the texture's on-screen
+`<room>_lights`. By default the game's full value is 2000 lux, which
+Blender's importer (it divides by 683 lumens per watt) shows at about the
+texture's own brightness. Godot and Unity's URP use the number as it is, so
+there those lights come out about 2000 times too bright: export the rooms
+with `--light-units unitless` (full value = 1) for them. glTFast divides
+the intensity by π in Unity's built-in pipeline, so there a light intensity
+factor of 3.14 in its import settings should restore it (not tested); HDRP
+takes the default physical units. The game applies the light to the texture's on-screen
 value rather than in linear light, so physically lit materials look brighter
 than the game in dim scenes; the Blender assembly script reproduces the
 game's shading (see [docs/BLENDER_CUTSCENES.md](docs/BLENDER_CUTSCENES.md)).
