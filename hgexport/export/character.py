@@ -8,6 +8,7 @@ from typing import Iterable
 
 from ..formats.marks import parse_mrk, sparse
 from ..formats.motion import Group, MotionBank
+from ..formats.motiontable import looping_ids
 from ..formats.pck import FIXED12, PckModel, parse_pck, strip_triangles
 from ..gltf.builder import GltfBuilder
 from ..util.mathutil import (euler_to_quat, make_continuous, mat4_mul, mat4_point, mat4_rigid_inverse,
@@ -216,6 +217,8 @@ class CharacterBuilder:
         self.report: dict = {"model": model.name, "warnings": []}
         self.markers_used: set[int] = set()
         self._feet = None
+        # the game's loop flags for the model's own bank (None: no known table)
+        self.loop_ids = looping_ids(model.motion.lookup) if model.motion else None
         prefix = model.name
         self.factory = (MaterialFactory(self.b, textures.images, prefix, textures.sources, opts.unlit,
                                        opts.bleed)
@@ -648,14 +651,18 @@ class CharacterBuilder:
             for suffix, parts in plans:
                 base = names.get(entry.index) if names else None
                 name = f"{prefix}{base or f'{entry.index:03d}'}{suffix}"
-                anim = self._clip(name, parts)
+                loop = (any(i in self.loop_ids for i in ids)
+                        if bank is self.model.motion and self.loop_ids is not None else None)
+                anim = self._clip(name, parts, bool(loop))
                 if anim is None:
                     continue
                 if self.opts.root_motion and suffix == "":
-                    self._root_motion(anim, entry.slots[0], parts[0][1].frames)
+                    self._root_motion(anim, entry.slots[0], parts[0][1].frames, bool(loop))
                 anim["extras"] = {"entry": entry.index, "slots": [s for s, _ in parts],
                                   "frames": parts[0][1].frames, "fps": self.opts.fps,
                                   "resource_ids": [f"0x{i:X}" for i in ids]}
+                if loop is not None:
+                    anim["extras"]["loop"] = loop
                 if extras and entry.index in extras:
                     anim["extras"].update(extras[entry.index])
                 if self.opts.feet and suffix == "":
@@ -664,7 +671,7 @@ class CharacterBuilder:
                         anim["extras"].update(feet)
                         self.report["foot_clips"] = self.report.get("foot_clips", 0) + 1
                 if record is not None and self.opts.hand_poses and suffix == "" and bank is self.model.motion:
-                    self._hand_poses(anim, bank, ids[0], record, parts[0][1].frames)
+                    self._hand_poses(anim, bank, ids[0], record, parts[0][1].frames, bool(loop))
                 if record is not None:
                     # per-frame MRK bits of this animation ID (game reader 0x1F4770)
                     anim["extras"]["markers"] = sparse(record, parts[0][1].frames)
@@ -675,7 +682,8 @@ class CharacterBuilder:
                               "slots": [s for s, _ in parts], "resource_ids": ids})
         return clips
 
-    def _hand_poses(self, anim: dict, bank: MotionBank, rid: int, record: bytes, frames: int) -> None:
+    def _hand_poses(self, anim: dict, bank: MotionBank, rid: int, record: bytes, frames: int,
+                    loop: bool = False) -> None:
         """MRK bits 4 / 8 toggle the two hand mixers (formats/handpose.py)."""
         from ..formats.handpose import hand_table, hand_weights, simulate
         table = hand_table(self.model.name)
@@ -705,14 +713,18 @@ class CharacterBuilder:
                         row_w[mapping[side][shape]] += w
             rows.append(row_w)
         times = [f / self.opts.fps for f in range(frames)] if frames > 1 else [0.0]
+        if loop:
+            times, rows = times + [frames / self.opts.fps], rows + [rows[0]]
         anim["samplers"].append(self.b.anim_sampler(times, rows, "WEIGHTS", "LINEAR"))
         anim["channels"].append({"sampler": len(anim["samplers"]) - 1,
                                  "target": {"node": self.mesh_node, "path": "weights"}})
 
-    def _root_motion(self, anim: dict, controls: Group | None, frames: int) -> None:
+    def _root_motion(self, anim: dict, controls: Group | None, frames: int, loop: bool = False) -> None:
         """Controller -1 holds per-update steps: a heading increment (Euler Y)
         and a translation in the actor's local frame. The game adds the
-        heading first, then moves by the step rotated by the new heading."""
+        heading first, then moves by the step rotated by the new heading.
+        A looping clip gets one more key, after the last frame's step: the
+        whole cycle's movement, where the next cycle starts."""
         b, s, fps = self.b, self.opts.scale, self.opts.fps
         track = next((t for t in (controls.tracks if controls else []) if t.target == -1 and t.codec == 7), None)
         samples = (track.samples if track and len(track.samples) == frames else
@@ -727,6 +739,10 @@ class CharacterBuilder:
             step = quat_rotate(euler_to_quat(0.0, heading, 0.0), (v[3] * s, v[4] * s, v[5] * s))
             pos = [pos[k] + step[k] for k in range(3)]
         times = [i / fps for i in range(frames)] if frames > 1 else [0.0]
+        if loop:
+            positions.append(tuple(pos))
+            quats.append(euler_to_quat(0.0, heading, 0.0))
+            times.append(frames / fps)
         tin = b.times(times)
         for path, values, kind in (("translation", positions, "VEC3"),
                                    ("rotation", make_continuous(quats), "VEC4")):
@@ -734,12 +750,15 @@ class CharacterBuilder:
             anim["channels"].append({"sampler": len(anim["samplers"]) - 1,
                                      "target": {"node": self.motion_node, "path": path}})
 
-    def _clip(self, name: str, parts: list[tuple[int, Group]]) -> dict | None:
+    def _clip(self, name: str, parts: list[tuple[int, Group]], loop: bool = False) -> dict | None:
+        """Bone keys, one per frame. A looping clip (the game wraps its time at
+        the frame count) ends with frame 0 again one frame after the last, so
+        players loop it without dropping the last-to-first step."""
         b, m, fps, s = self.b, self.model, self.opts.fps, self.opts.scale
         samplers, channels = [], []
         seen: set[int] = set()
         for _slot, g in parts:
-            full_times = [i / fps for i in range(g.frames)]
+            full_times = [i / fps for i in range(g.frames + (1 if loop else 0))]
             for t in g.tracks:
                 if t.target < 0 or t.codec not in (0, 1, 2, 4, 7):
                     continue
@@ -753,10 +772,12 @@ class CharacterBuilder:
                 seen.add(bone)
                 samples = t.samples
                 if len(samples) == 1:
-                    times = [0.0] if g.frames == 1 else [0.0, full_times[-1]]
+                    times = [0.0] if len(full_times) == 1 else [0.0, full_times[-1]]
                     samples = samples * len(times)
                 else:
                     times = full_times
+                    if loop:
+                        samples = list(samples) + [samples[0]]
                 if t.codec != 1:
                     quats = make_continuous([euler_to_quat(v[0], v[1], v[2]) for v in samples])
                     samplers.append(b.anim_sampler(times, quats, "VEC4"))

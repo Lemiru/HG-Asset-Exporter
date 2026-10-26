@@ -173,6 +173,16 @@ the character's extra animation files get the file name in front
 only a few bones (ears, tail, mouth); when it cannot be merged with the main
 animation it becomes its own clip (`017_layer3`).
 
+**Looping.** Animations the game loops (walks, runs, idles; the flag
+comes from each character's animation table in the game) end with their
+first frame again one frame after the last, so they loop seamlessly: the
+game shows frame 0 right after the last frame. These clips have
+`"loop": true` in their extras, one-shot animations `"loop": false`; clips
+of models whose table is not known (minor characters, extra animation
+files) have no `loop` entry and end on their last frame. In Blender the
+closing frame repeats the first, so set the loop range to end one frame
+earlier.
+
 **Root motion.** The game moves characters by their animations: each
 animation stores how far it turns and steps on every frame, and that is
 where walking and running speeds come from (Fiona's walk 0.46 units a frame,

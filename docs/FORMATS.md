@@ -393,6 +393,22 @@ Animations run at 30 frames per second (verified against cutscene audio).
 [Rooms](#doors)); `OBSTACLE.MTN` is a plain curve (see
 [Other files](#obstaclemtn)).
 
+### Looping
+
+Whether an animation loops is not in the motion bank: each model class
+points its animation player (controller +0x874) at a table in the
+executable with one 6-byte row per lookup row (`s16` blend-in frames,
+`s16` hand-pose type, `u16` flags). Flag 0x1 loops the animation: its
+time wraps at the frame count (`0x1F51CC`), so frame 0 follows the last
+frame one update later; otherwise the time stops on the last frame. Flag
+0x4 turns on the slope factor (`0x2DD980`). Tables are known for Fiona
+(`0x3D5CC0`; all costume sets, FIM), Hewie (`0x3D5F90`), Debilitas
+(`0x3D89A0`), Daniella (`0x419E60`), Riccardo (`0x41A2C0`; RCT), Lorenzo
+(`0x4246C0`) and young Lorenzo (`0x424490`); `formats/motiontable.py`
+holds their loop flags. Looping clips get a closing key at
+`frames / 30` s equal to frame 0 (the root bone: after the whole cycle's
+movement) and `"loop": true` in their extras.
+
 ### Controller tracks
 
 | Target | Meaning | Exported as |

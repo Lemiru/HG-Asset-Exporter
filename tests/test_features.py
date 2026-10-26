@@ -399,6 +399,19 @@ class ModelAndSceneTests(unittest.TestCase):
             ch = next(c for c in walk["channels"] if c["target"] == {"node": motion, "path": "translation"})
             pos = g.accessor(walk["samplers"][ch["sampler"]]["output"])
             self.assertAlmostEqual(pos[1][2], 0.04767, places=4)
+            # the walk loops in the game (motion table flag 0x1): frame 0 again one frame after the last,
+            # and the root ends after the whole cycle (14.791 units)
+            self.assertTrue(walk["extras"]["loop"])
+            self.assertEqual(len(pos), 33)
+            self.assertAlmostEqual(g.accessor(walk["samplers"][ch["sampler"]]["input"])[-1][0], 32 / 30, places=5)
+            self.assertAlmostEqual(pos[-1][2], 1.4791, places=3)
+            for c in walk["channels"]:
+                out_ = g.accessor(walk["samplers"][c["sampler"]]["output"])
+                if c["target"]["node"] != motion and len(out_) == 33:
+                    self.assertEqual(out_[0], out_[-1])
+            rest = next(a for a in g.json["animations"] if "0x1" in a["extras"]["resource_ids"])
+            self.assertFalse(rest["extras"]["loop"])
+            self.assertAlmostEqual(g.accessor(rest["samplers"][0]["input"])[-1][0], 165 / 30, places=5)
             export_character(DATA / "O_FIN" / "FIN_000.PCK", out, CharacterOptions(root_motion=False))
             self.assertFalse(any(n["name"] == "root" for n in Gltf(out).json["nodes"]))
 
