@@ -100,32 +100,47 @@ class Prim:
         return out
 
 
-# Optional jewelry inside Fiona's main outfit (identified visually by the
-# previous project). Matched by submesh vertex counts, so it applies to every
-# FIN_* model sharing the layout.
+# Optional jewelry inside Fiona's main outfit. Matched by submesh vertex
+# counts, so it applies to every FIN_* model sharing the layout. The game has
+# no names for them: its accessory setter (0x2F6E60, on the model object)
+# takes a number, hides every part of that slot and shows the number's parts
+# (1-4 earrings, 0 none; 5-9 neck, 5 the default). The objects are named
+# <slot>_<item>; FIN_ACCESSORY_INFO keeps the number and the item's name (the
+# MSG_BASE item list, entries 390-397).
 ACCESSORIES = {
-    "FIN": [("Default Neck Accessory", (("skinned", 3), ("skinned", 4))),
-            ("Inquisitor Earrings", (("skinned", 32),)),
-            ("Philosopher Earrings", (("rigid", 2),)),
-            ("Alchemist Earrings", (("rigid", 3),)),
-            ("Fairy Earrings", (("skinned", 33),)),
-            ("Jade Choker", (("skinned", 5),)),
-            ("Ruby Choker", (("skinned", 22),)),
-            ("Diamond Choker", (("skinned", 6), ("skinned", 7))),
-            ("Obsidian Choker", (("skinned", 23), ("skinned", 24)))],
+    "FIN": [("neck_default", (("skinned", 3), ("skinned", 4))),
+            ("earrings_inquisitor", (("skinned", 32),)),
+            ("earrings_philosopher", (("rigid", 2),)),
+            ("earrings_alchemist", (("rigid", 3),)),
+            ("earrings_fairy", (("skinned", 33),)),
+            ("neck_jade", (("skinned", 5),)),
+            ("neck_ruby", (("skinned", 22),)),
+            ("neck_diamond", (("skinned", 6), ("skinned", 7))),
+            ("neck_obsidian", (("skinned", 23), ("skinned", 24)))],
     # Daniella's long glass shard: a rigid piece on her hand prop bone
     # (bone 45 = palette J24) that the game shows only in some scenes.
     # Two submeshes, both on that bone only: the opaque blade (rigid 5) and its
     # translucent glass layer (skinned 17).
-    "DNL": [("Glass Shard", (("rigid", 5), ("skinned", 17)))],
+    "DNL": [("glass_shard", (("rigid", 5), ("skinned", 17)))],
 }
 # Submesh vertex counts that identify the layout each table was made for.
 SIGNATURES = {
     "FIN": {("skinned", 3): 30, ("skinned", 4): 18, ("skinned", 32): 64},
     "DNL": {("rigid", 5): 192, ("skinned", 17): 78},
 }
-UNLOCKABLE_ACCESSORIES = ("Inquisitor Earrings", "Philosopher Earrings", "Alchemist Earrings", "Fairy Earrings",
-                          "Jade Choker", "Ruby Choker", "Diamond Choker", "Obsidian Choker")
+# object -> (slot, the game's accessory number, item name or None)
+FIN_ACCESSORY_INFO = {
+    "earrings_inquisitor": ("earrings", 1, "Inquisitor Earrings"),
+    "earrings_philosopher": ("earrings", 2, "Philosopher Earrings"),
+    "earrings_alchemist": ("earrings", 3, "Alchemist Earrings"),
+    "earrings_fairy": ("earrings", 4, "Fairy Earrings"),
+    "neck_default": ("neck", 5, None),
+    "neck_jade": ("neck", 6, "Jade Choker"),
+    "neck_ruby": ("neck", 7, "Ruby Choker"),
+    "neck_diamond": ("neck", 8, "Diamond Choker"),
+    "neck_obsidian": ("neck", 9, "Obsidian Choker"),
+}
+UNLOCKABLE_ACCESSORIES = tuple(k for k, (_slot, _n, item) in FIN_ACCESSORY_INFO.items() if item)
 
 
 def _part_groups(model: PckModel, opts: "CharacterOptions") -> dict[tuple[str, int], str]:
@@ -402,6 +417,10 @@ class CharacterBuilder:
                 mesh["weights"] = self._default_weights(targets)
                 mesh["extras"] = {"targetNames": self.target_names}
             node = {"name": name, "mesh": self.b.mesh(mesh)}
+            if name in FIN_ACCESSORY_INFO:
+                slot, number, item = FIN_ACCESSORY_INFO[name]
+                node["extras"] = {"accessory_slot": slot, "game_accessory": number,
+                                  **({"item_name": item} if item else {"note": "the plain accessory, not an item"})}
             if skin is not None:
                 node["skin"] = skin
             index = self._node(node, top=True)

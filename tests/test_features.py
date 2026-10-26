@@ -424,11 +424,12 @@ class ModelAndSceneTests(unittest.TestCase):
         from hgexport.export.cutscene import cutscene_hidden_parts
         with tempfile.TemporaryDirectory() as tmp:
             rep = export_character(DATA / "O_DNL" / "DNL_000.PCK", Path(tmp) / "d.glb")
-            self.assertEqual(rep["parts"], ["Glass Shard"])
+            self.assertEqual(rep["parts"], ["glass_shard"])
             g = Gltf(Path(tmp) / "d.glb")
-            self.assertIn("Glass Shard", [n.get("name") for n in g.json["nodes"]])
-        self.assertEqual(cutscene_hidden_parts("DNL_000", "EV0002"), ("Glass Shard",))
-        self.assertIn("Jade Choker", cutscene_hidden_parts("FIN_000", "EV0002"))
+            self.assertIn("glass_shard", [n.get("name") for n in g.json["nodes"]])
+        self.assertEqual(cutscene_hidden_parts("DNL_000", "EV0002"), ("glass_shard",))
+        self.assertIn("neck_jade", cutscene_hidden_parts("FIN_000", "EV0002"))
+        self.assertNotIn("neck_default", cutscene_hidden_parts("FIN_000", "EV0002"))
         self.assertEqual(cutscene_hidden_parts("HEW_000", "EV0002"), ())
 
     def test_room_look_and_glow_geometry(self):

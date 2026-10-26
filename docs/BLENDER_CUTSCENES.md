@@ -57,7 +57,7 @@ EV0014                (empty, scene root)
 ├─ A01_FIN_000        stand-in skeleton   ──► characters/O_FIN/FIN_000.glb
 │  │  model_file      = characters/O_FIN/FIN_000.glb
 │  │  texture_variant = cutscene
-│  │  hidden_parts    = [Inquisitor Earrings, ...]
+│  │  hidden_parts    = [earrings_inquisitor, ...]
 │  │  bones J00, J01 ...                      same names as in FIN_000_skeleton
 │  └─ A01_FIN_000_blendshapes  tiny mesh with the face and hand shape keys
 │                                             same names as on the FIN_000 mesh
@@ -392,8 +392,8 @@ You get:
 
 * `FIN_000_skeleton`, the armature;
 * `FIN_000`, the body mesh with its shape keys;
-* for Fiona, her jewellery as separate objects (`Default Neck Accessory`,
-  `Jade Choker`, `Inquisitor Earrings`, …);
+* for Fiona, her jewellery as separate objects (`neck_default`,
+  `neck_jade`, `earrings_inquisitor`, …; see FORMATS.md);
 * her gameplay animations as actions, stored as **muted** NLA tracks so
   they do not interfere.
 
@@ -462,7 +462,7 @@ for s in O["FIN_000"].material_slots:
 
 **Jewellery and the glass shard.** Fiona's file contains all her unlockable
 earrings and chokers as separate objects, and Daniella's has her glass shard
-as the object `Glass Shard`. Cutscenes show only Fiona's default neck
+as the object `glass_shard`. Cutscenes show only Fiona's default neck
 accessory and no shard: hide the objects listed in `hidden_parts` (both the
 eye and the camera icon in the outliner), or delete them.
 

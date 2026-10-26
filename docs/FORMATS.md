@@ -245,9 +245,26 @@ fully opaque pixels dominate the piece; on uniformly tinted glass only
 blended otherwise. No unflagged mesh in the game samples alpha 0, and the
 flagged ones are solid except along hems, fringes and hair ends.
 
-A byte per mesh in the character object (`+136 + 2i`) is combined with the
+A byte per mesh in the character object (`+0x98 + 2i`) is combined with the
 mesh's flags when drawing; its bit 1 hides the mesh. The game uses this to
-switch accessories on and off.
+switch accessories on and off. Fiona's are numbered, not named: the setter
+at `0x2F6E60` hides every mesh of a slot and shows the number's meshes,
+1–4 the earrings (0 none) and 5–9 the neck (5 the plain one she wears by
+default). The export names them `<slot>_<item>` and keeps the number and
+the item's name (the item list in `MSG_BASE`, entries 390–397) in the
+object's extras:
+
+| Object | Number | Item | Meshes |
+| --- | --- | --- | --- |
+| `earrings_inquisitor` | 1 | Inquisitor Earrings | skinned 32 |
+| `earrings_philosopher` | 2 | Philosopher Earrings | rigid 2 |
+| `earrings_alchemist` | 3 | Alchemist Earrings | rigid 3 |
+| `earrings_fairy` | 4 | Fairy Earrings | skinned 33 |
+| `neck_default` | 5 | — | skinned 3, 4 |
+| `neck_jade` | 6 | Jade Choker | skinned 5 |
+| `neck_ruby` | 7 | Ruby Choker | skinned 22 |
+| `neck_diamond` | 8 | Diamond Choker | skinned 6, 7 |
+| `neck_obsidian` | 9 | Obsidian Choker | skinned 23, 24 |
 
 The value 4 in the same byte selects lit drawing programs that add a
 highlight (`max(R·V, 0)^4` times each light's strength), and the byte after
@@ -823,7 +840,8 @@ EV0003 continues with slots 12 (FIW_200) and 11 (FIN_200).
 
 **Props (sections 40–47).** Props whose names match one of the room's
 named objects animate that object (exported under the room stand-in with
-the room object's name); the others are exported as `prop_<name>` empties.
+the room object's name); the others are exported as `prop_<name>` empties
+(`prop_<name>_2`, `_3` … when a section lists the same name again).
 At the start of every shot the game also sets the objects' visibility
 (`Cutscene_StartShot`, `0x2CC130`): the objects listed in a prop group are
 shown in the shots whose prop-group mask has that group, and hidden in the

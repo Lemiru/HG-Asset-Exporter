@@ -93,7 +93,7 @@ class _Track:
             self.values.append(v)
 
 
-# Daniella's glass shard (a separate "Glass Shard" object in her character
+# Daniella's glass shard (a separate "glass_shard" object in her character
 # file) is hidden in cutscenes except these, where the game shows it.
 SHARD_EVENTS: frozenset[str] = frozenset()
 
@@ -104,7 +104,7 @@ def cutscene_hidden_parts(model_name: str, event: str) -> tuple[str, ...]:
     if family == "FIN":
         return UNLOCKABLE_ACCESSORIES
     if family == "DNL" and event.upper() not in SHARD_EVENTS:
-        return ("Glass Shard",)
+        return ("glass_shard",)
     return ()
 
 
@@ -473,6 +473,7 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
     prop_nodes: dict[str, int] = {}
     prop_tracks: dict[str, tuple[_Track, _Track]] = {}
     bound_rest: dict[str, tuple] = {}
+    prop_labels: set[str] = set()
     for (cut, data), room in zip(cuts, cut_rooms):
         seen: dict[str, int] = {}
         objects = room_objects.get(room, {})
@@ -492,7 +493,10 @@ def export_event(event_dir: Path | str, out: Path | str, opts: CutsceneOptions |
                     prop_nodes[key] = target[0]
                     bound_rest[key] = (target[1], target[2])
                 else:
-                    label = prop.name if seen[base] == 1 else f"{prop.name}.{seen[base]}"
+                    label = prop.name if seen[base] == 1 else f"{prop.name}_{seen[base]}"
+                    while f"prop_{label}" in prop_labels:       # a repeat named like another prop
+                        label += "_"
+                    prop_labels.add(f"prop_{label}")
                     node = b.node({"name": f"prop_{label}", "extras": {"dp_section": prop.section}})
                     b.add_child(scene_root, node)
                     prop_nodes[key] = node
