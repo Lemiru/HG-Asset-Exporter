@@ -13,6 +13,7 @@ from ..util.mathutil import euler_to_quat, look_at_quat, make_continuous
 from .alpha import assign_modes
 from .look import LOOK_NOTE, engine_looks, room_variants
 from .reflection import REFLECTION_NOTE, room_reflections
+from .roomlogic import camera_node, fixed_sets, rail_set, room_entry, zone_extras, zone_name
 from .meshutil import VertexWelder
 from .textures import MaterialFactory, TextureSet
 
@@ -30,7 +31,7 @@ class StageOptions:
     animations: bool = True        # atlas, door, fan and shape-object clips
     door_motion: Path | None = None   # *_D000.MTN door-angle bank (FIN_D000 = player)
     extra_door_motion: list = field(default_factory=list)   # pursuer *_D000.MTN banks embedded as extra clips
-    cameras: bool = True           # gameplay camera rails (slot 6) as animated cameras
+    cameras: bool = True           # gameplay cameras: rails (slot 6) animated, fixed sets (slot 5) still
     navmesh: bool = False          # walkable-floor navigation mesh as an extra node
     lights: bool = True            # slot-4 character lights as KHR_lights_punctual nodes
     light_units: str = "physical"  # glTF light intensities: "physical" (128 = 2000 lux) or "unitless" (128 = 1)
@@ -318,8 +319,7 @@ class StageBuilder:
         if self.opts.animations:
             self._object_motion_clips()
         if self.opts.cameras:
-            for cam in st.cameras:
-                self._camera_rail(root, cam)
+            self._cameras(root)
         if self.opts.navmesh:
             self._navmesh(root)
         for clip in self.clips:
@@ -503,29 +503,61 @@ class StageBuilder:
         self._clip(f"{name}_close", node, "weights", times, [1.0, 0.0], "SCALAR",
                    extras={"note": "generic blend back to stored shape 0"})
 
-    def _camera_rail(self, root: int, cam) -> None:
+    def _cameras(self, root: int) -> None:
+        """One camera per way the room's scripts use its cameras: each rail
+        with the set it belongs to, each set used without a rail. Sets the
+        scripts do not use, and that no rail belongs to, are kept as fixed
+        cameras (used_by_scripts false)."""
+        st = self.stage
+        sets = {c.index: c for c in st.camera_sets}
+        paired = set()
+        for cam in st.cameras:
+            index = rail_set(st.name, cam.index)
+            paired.add(index)
+            self._camera_rail(root, cam, index, sets.get(index))
+        fixed = fixed_sets(st.name)
+        for c in st.camera_sets:
+            if c.index in fixed or c.index not in paired:
+                self._camera_fixed(root, c, c.index in fixed)
+
+    def _camera(self, name: str, fov_degrees: float, translation, rotation, extras: dict) -> int:
+        aspect = 4.0 / 3.0
+        yfov = 2 * math.atan(math.tan(math.radians(fov_degrees) / 2) / aspect)
+        camera = self.b.camera({"name": name, "type": "perspective",
+                                "perspective": {"yfov": yfov, "aspectRatio": aspect, "znear": 0.01, "zfar": 1000.0}})
+        return self.b.node({"name": name, "camera": camera, "translation": list(translation),
+                            "rotation": list(rotation),
+                            "extras": {"kind": "gameplay_camera", "horizontal_fov_degrees": fov_degrees, **extras}})
+
+    def _camera_fixed(self, root: int, cam, used: bool) -> None:
+        """A set without a rail: the game keeps the camera here and turns it to
+        keep the character in view, so the rotation is only where it starts."""
+        s = self.opts.scale
+        pos = [c * s for c in cam.position]
+        node = self._camera(camera_node(self.stage.name, cam.index, None), cam.fov_degrees, pos,
+                            look_at_quat(pos, [c * s for c in cam.target]),
+                            {"camera_set": cam.index, "camera_rail": None, "used_by_scripts": used})
+        self.b.add_child(root, node)
+
+    def _camera_rail(self, root: int, cam, set_index: int | None, preset) -> None:
         """Gameplay cameras slide along a rail as the player moves: position
         (curves 0-2) and look-at target (curves 3-5) as functions of a 1..100
         progress parameter. Exported as a camera whose clip runs the rail at
         one parameter step per frame."""
         if len(cam.keys) < 6:
             return
-        s, b = self.opts.scale, self.b
-        aspect = 4.0 / 3.0
-        yfov = 2 * math.atan(math.tan(math.radians(cam.fov_degrees) / 2) / aspect)
+        s = self.opts.scale
         lo, hi = cam.keys[0][0][0], cam.keys[0][-1][0]
         params = [lo + (hi - lo) * i / 99 for i in range(100)]
         pos = [tuple(cam.sample(c, p) * s for c in range(3)) for p in params]
         tgt = [tuple(cam.sample(c, p) * s for c in range(3, 6)) for p in params]
         quats = make_continuous([look_at_quat(a, t) for a, t in zip(pos, tgt)])
-        name = f"{self.stage.name}_cam{cam.index}"
-        camera = b.camera({"name": name, "type": "perspective",
-                           "perspective": {"yfov": yfov, "aspectRatio": aspect, "znear": 0.01, "zfar": 1000.0}})
-        node = b.node({"name": name, "camera": camera, "translation": list(pos[0]), "rotation": list(quats[0]),
-                       "extras": {"kind": "gameplay_camera", "horizontal_fov_degrees": cam.fov_degrees}})
-        b.add_child(root, node)
+        name = camera_node(self.stage.name, set_index, cam.index)
+        node = self._camera(name, preset.fov_degrees if preset else cam.fov_degrees, pos[0], quats[0],
+                            {"camera_set": set_index, "camera_rail": cam.index})
+        self.b.add_child(root, node)
         times = [i / self.opts.updates_per_second for i in range(100)]
-        clip = self._clip(f"{name}_rail", node, "translation", times, pos, "VEC3",
+        clip = self._clip(f"{name}_motion", node, "translation", times, pos, "VEC3",
                           extras={"note": "time = progress along the camera rail (1..100), not real time"})
         self._clip("", node, "rotation", times, quats, "VEC4", clip=clip)
 
@@ -698,9 +730,16 @@ def export_zones(pac: Path | str, out: Path | str, scale: float = 0.1) -> dict:
         return {"zones": 0}
     b = GltfBuilder("hgexport zones")
     stem = Path(pac).stem
+    logic = room_entry(stem).get("zones", {})
     root = b.node({"name": f"{stem}_zones", "extras": {
         "note": "PAC slot 2: room-script trigger geometry; boundary = line the scripts test for crossing, "
-                "area = quad they test for inside; 'height' is the record's vertical parameter (game units)"}},
+                "area = quad they test for inside (the whole character must fit; the order of the points matters "
+                "for both); a zone applies from its points' height up to 'height'. Names and 'uses' come from the "
+                "room's scripts: exit, camera (with its node in the room file; 'direction' is the crossing it "
+                "needs), prefetch (loads the next room early), action (a room action script; shared_action: one "
+                "of the game's), facing (the character must face it), trigger (tested, with no more specific "
+                "effect found), unused_here (used by a variant of this room, see 'used_in'), unknown (nothing "
+                "the game does was found to use it)"}},
         root=True)
     colors = {"boundary": [1.0, 0.2, 0.1, 1.0], "area": [0.1, 0.5, 1.0, 0.35]}
     mats = {k: b.material({"name": f"zone_{k}", "pbrMetallicRoughness": {"baseColorFactor": c,
@@ -716,10 +755,11 @@ def export_zones(pac: Path | str, out: Path | str, scale: float = 0.1) -> dict:
         else:
             prim = {"attributes": {"POSITION": b.positions(pts)}, "indices": b.indices([0, 1, 2, 0, 2, 3]),
                     "mode": 4, "material": mats["area"]}
-        name = f"zone{z.index:02d}_{z.kind}"
+        uses = logic.get(str(z.index))
+        name = zone_name(z.index, z.kind, uses)
         mesh = b.mesh({"name": name, "primitives": [prim]})
         b.add_child(root, b.node({"name": name, "mesh": mesh, "extras": {
             "index": z.index, "kind": z.kind, "height": round(z.height * scale, 4),
-            "points": [[round(c, 4) for c in p] for p in pts]}}))
+            "points": [[round(c, 4) for c in p] for p in pts], "uses": zone_extras(stem, uses)}}))
     b.write(Path(out))
     return {"zones": len(zones), "boundaries": sum(z.kind == "boundary" for z in zones)}

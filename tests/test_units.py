@@ -8,6 +8,7 @@ from pathlib import Path
 from collections import Counter
 
 from hgexport.export.alpha import AlphaSampler, assign_modes, elements, texel_mode
+from hgexport.export.roomlogic import camera_node, zone_extras, zone_name
 from hgexport.formats.audio import Pcm, decode_vag, sq_to_midi
 from hgexport.formats.motion import parse_motion_bank
 from hgexport.formats.pck import strip_triangles
@@ -217,6 +218,35 @@ class KeyReductionTests(unittest.TestCase):
         t, v = drop_flat_keys([0, 1, 2, 3, 4, 5], [1, 1, 1, 2, 2, 2])
         self.assertEqual((t, v), ([0, 2, 3, 5], [1, 1, 2, 2]))
         self.assertEqual(drop_flat_keys([0, 1, 2], [(0, 0), (0, 0), (0, 0)]), ([0, 2], [(0, 0), (0, 0)]))
+
+
+class RoomLogicTests(unittest.TestCase):
+    def test_zone_names(self):
+        self.assertEqual(zone_name(4, "area", None), "zone04__area__unknown")
+        self.assertEqual(zone_name(4, "area", {"characters": [0]}), "zone04__area__trigger")
+        self.assertEqual(zone_name(4, "area", {"used_in": [{"room": "ST_021", "zone": 4}]}), "zone04__area__unused_here")
+        self.assertEqual(zone_name(1, "area", {"exits": [{"exit": 1, "leads_to": []}],
+                                               "cameras": [{"set": 2, "rail": None}]}),
+                         "zone01__area__exit1__camera_set2_fixed")
+        self.assertEqual(zone_name(2, "boundary", {"cameras": [{"set": 1, "rail": 0, "direction": 1},
+                                                               {"set": 1, "rail": 0, "direction": -1}],
+                                                   "prefetch": [{"exit": 0}, {"room": "ST_0F0"}]}),
+                         "zone02__boundary__camera_set1_rail0__prefetch_exit0__prefetch_ST_0F0")
+        self.assertEqual(zone_name(3, "area", {"actions": [4, 0x82], "facing": True}),
+                         "zone03__area__action4__shared_action2__facing")
+        self.assertEqual(zone_name(3, "area", {"actions": [1, 2, 3, 4, 5]}), "zone03__area__action1__action2__action3__plus2")
+
+    def test_zone_with_two_cameras(self):
+        self.assertEqual(zone_name(5, "boundary", {"cameras": [{"set": 1, "rail": 0}, {"set": 3, "rail": None}]}),
+                         "zone05__boundary__camera_set1_rail0__camera_set3_fixed")
+
+    def test_camera_nodes(self):
+        self.assertEqual(camera_node("ST_012", 1, 0), "ST_012_cam_set1_rail0")
+        self.assertEqual(camera_node("ST_012", 2, None), "ST_012_cam_set2_fixed")
+        self.assertEqual(camera_node("ST_012", None, 4), "ST_012_cam_rail4")
+        self.assertEqual(zone_extras("ST_012", {"cameras": [{"set": 2, "rail": None}]})["cameras"][0]["node"],
+                         "ST_012_cam_set2_fixed")
+        self.assertEqual(zone_extras("ST_012", None), {})
 
 
 if __name__ == "__main__":

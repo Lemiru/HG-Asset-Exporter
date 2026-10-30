@@ -486,7 +486,7 @@ for every `Axx_…` object.
    camera paths), which do not belong in the cutscene. If any of these
    objects has an action (*Object > Animation*, or for curtains the mesh's
    *Shape Key Editor*), clear it with the X button. Hide the room's own
-   cameras (`ST_011_cam0`, …).
+   cameras (`ST_011_cam_set1_rail0`, …).
 4. Animated textures (`ST_xxx_atlasNN`) and fans (`…_fan…`) come with one
    cycle of their loop. To keep them running, select them, open the *Graph
    Editor*, select all channels and use *Channel > Extrapolation Mode > Make

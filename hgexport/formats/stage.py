@@ -144,7 +144,7 @@ class NamedObject:
 class CameraCurve:
     index: int
     keys: list[list[tuple]]     # curves x key records (6 floats, 2 words)
-    fov_degrees: float = 60.0   # from slot 5 (horizontal field of view)
+    fov_degrees: float = 60.0   # horizontal, from the set with the same number
 
     def sample(self, curve: int, p: float) -> float:
         """Evaluate one cubic Bezier curve at progress parameter ``p``. Keys
@@ -168,6 +168,16 @@ class CameraCurve:
 
 
 @dataclass
+class CameraSet:
+    """Slot 5 preset. A room's scripts request a camera as (set, path): the
+    set alone is a fixed camera, a path (slot 6) makes it follow that rail."""
+    index: int
+    position: tuple[float, float, float]
+    fov_degrees: float                     # horizontal
+    target: tuple[float, float, float]
+
+
+@dataclass
 class Stage:
     name: str
     groups: dict[int, list[DrawRecord]]
@@ -178,6 +188,7 @@ class Stage:
     lighting: "RoomLighting | None" = None                 # slot 4 (character lighting)
     effects: dict = field(default_factory=dict)           # slot 13 (formats/roomdata.py)
     object_motion: list = field(default_factory=list)     # slot 15 (formats/roomdata.py)
+    camera_sets: list[CameraSet] = field(default_factory=list)   # slot 5
 
 
 def _main_groups(pac: Pac) -> dict[int, list[DrawRecord]]:
@@ -324,6 +335,22 @@ def _cameras(pac: Pac) -> list[CameraCurve]:
     return cams
 
 
+def _camera_sets(pac: Pac) -> list[CameraSet]:
+    """Slot 5: 32 bytes per set (position, horizontal field of view in
+    degrees, target, 0), ended by an entry of NaNs."""
+    reg = pac.region(5)
+    if not reg:
+        return []
+    r = Reader(pac.data, pac.name, limit=reg[1])
+    out = []
+    for i in range((reg[1] - reg[0]) // 32):
+        v = r.unpack("7f", reg[0] + i * 32, "camera set")
+        if not all(math.isfinite(c) for c in v):
+            break
+        out.append(CameraSet(i, v[0:3], v[3], v[4:7]))
+    return out
+
+
 def parse_stage(path: Path | str) -> Stage:
     pac = parse_pac(path)
     tex_reg = pac.region(9)
@@ -332,19 +359,14 @@ def parse_stage(path: Path | str) -> Stage:
         cameras = _cameras(pac)
     except FormatError:
         cameras = []
-    # Slot 5: per camera start position, field of view (degrees), target, 0.
-    reg5 = pac.region(5)
-    if reg5 and cameras:
-        r5 = Reader(pac.data, pac.name, limit=reg5[1])
-        for i, cam in enumerate(cameras):
-            if reg5[0] + i * 32 + 32 <= reg5[1]:
-                fov = r5.f32(reg5[0] + i * 32 + 12)
-                if 5.0 < fov < 170.0:
-                    cam.fov_degrees = fov
+    sets = _camera_sets(pac)
+    for cam, preset in zip(cameras, sets):
+        if 5.0 < preset.fov_degrees < 170.0:
+            cam.fov_degrees = preset.fov_degrees
     lighting = parse_room_lighting(pac)
     from .roomdata import parse_object_motion, parse_room_effects
     return Stage(pac.name, _main_groups(pac), _doors(pac), _objects(pac), textures, cameras, lighting,
-                 parse_room_effects(pac), parse_object_motion(pac))
+                 parse_room_effects(pac), parse_object_motion(pac), sets)
 
 
 @dataclass

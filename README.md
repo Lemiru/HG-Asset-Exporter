@@ -70,7 +70,7 @@ run updates the matching entries in `manifest.json` and keeps the rest.
 | Folder | Contents |
 | --- | --- |
 | `characters/<folder>/` | One `.glb` per character model: mesh, skeleton, facial and hand blend shapes, every animation the game has for it. `<model>_shadow.glb` holds the simple shadow boxes the game uses for it. |
-| `stages/<folder>/` | One `.glb` per room: geometry with its baked lighting, doors, movable objects, animated textures, gameplay camera paths, the lights the game uses for characters. `<room>_navmesh.glb` is the walkable floor; `<room>_zones.glb` the trigger lines and areas the game's scripts use. |
+| `stages/<folder>/` | One `.glb` per room: geometry with its baked lighting, doors, movable objects, animated textures, gameplay camera paths, the lights the game uses for characters. `<room>_navmesh.glb` is the walkable floor; `<room>_zones.glb` the trigger lines and areas the game's scripts use, named after what they do (exits, camera switches, actions). |
 | `cutscenes/<event>/` | One `.glb` per real-time cutscene with its camera, the actors' animation and moving props, plus the soundtrack (`.wav`) and the event's movie layer (`.mp4`). The characters and rooms are not repeated inside; see [the Blender guide](docs/BLENDER_CUTSCENES.md). |
 | `textures/<folder>/` | Every image in the game as PNG, in the same folder structure as the game data. |
 | `audio/` | Voice and sound-effect recordings (`voice_sfx/`) and the instrument and effect banks (`banks/`) as WAV, with a JSON table per bank describing each sound effect. |
@@ -268,7 +268,8 @@ does it, [docs/FORMATS.md](docs/FORMATS.md#screen-look-tint-glow-geometry-and-bl
 **Cameras.** The game's field-of-view values are horizontal; exported
 cameras use the matching vertical value for a 4:3 picture. Render cutscenes
 at 4:3 (for example 1440 × 1080) to see what the game showed. Each room's
-gameplay cameras follow a path; the `_rail` clips move them along it.
+gameplay cameras either follow a rail (`<room>_cam_set<S>_rail<R>`, moved by
+its `_motion` clip) or stay in place (`<room>_cam_set<S>_fixed`).
 
 **Extra data.** Information that glTF has no field for is stored as *extras*
 (Blender shows them as custom properties): per-frame animation markers, foot

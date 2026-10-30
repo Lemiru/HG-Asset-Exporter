@@ -478,8 +478,8 @@ slot's data ends where the next different offset begins.
 | 2 | trigger lines and areas for room scripts | zones file |
 | 3 | room geometry | room meshes |
 | 4 | character lighting | lights and `character_lighting` extras |
-| 5 | gameplay camera start settings | camera nodes |
-| 6 | gameplay camera paths | camera `_rail` clips |
+| 5 | gameplay camera sets | fixed camera nodes, the field of view of rail cameras |
+| 6 | gameplay camera rails | rail camera nodes and their `_motion` clips |
 | 7 | door placements | door nodes |
 | 8 | door meshes | door nodes |
 | 9 | textures | room materials, `textures/ST_xxx/` |
@@ -576,14 +576,29 @@ exported as `<object>_motion<k>` clips.
 
 ### Gameplay cameras (slots 5 and 6)
 
-Slot 5 has 32 bytes per camera: start position, horizontal field of view in
-degrees (60), target. Slot 6: count, then pairs of curve and key counts;
-16-byte aligned 32-byte cubic keys (parameter, value, 4 handle values, mode,
-word). Each camera has six curves (position x, y, z and target x, y, z) of
-eleven keys over a progress value from 1 to 100. Exported as cameras with a
-`_rail` clip that runs the progress at one step per frame. The game's field
-of view is horizontal; exported cameras use the matching vertical value for
-4:3.
+Slot 5 holds camera *sets*, 32 bytes each: position, horizontal field of view
+in degrees, target; an entry of NaNs ends the list. Slot 6 holds *rails*:
+count, then pairs of curve and key counts; 16-byte aligned 32-byte cubic keys
+(parameter, value, 4 handle values, mode, word). Each rail has six curves
+(position x, y, z and target x, y, z) of eleven keys over a progress value
+from 1 to 100.
+
+Room scripts request a camera as a (set, rail) pair, and the two numbers are
+independent: in room 0x12, rail 0 belongs to set 1 and rail 1 to set 3. Every
+rail the scripts use belongs to exactly one set, which gives it its field of
+view (checked in an emulator). A set requested without a rail is a fixed
+camera: it stays at the set's position and turns to keep the character in
+view. Rooms 0x63 and 0xC1 request a rail their file does not have, which the
+game's loader ignores. The pairs come from `hgexport/data/room_logic.json`.
+
+Exported as `<room>_cam_set<S>_rail<R>`, with a `_motion` clip that runs the
+progress at one step per frame, and `<room>_cam_set<S>_fixed`, whose rotation
+is only where the camera starts. Extras give `camera_set` and `camera_rail`.
+Sets that no script uses and no rail belongs to are also exported as fixed
+cameras, with `used_by_scripts` false; `<room>_cam_rail<R>` is a rail that no
+script uses, so its set is not known and its field of view is that of the set
+with the same number. The game's field of view is horizontal; exported cameras
+use the matching vertical value for 4:3.
 
 ### Character lighting (slot 4)
 
@@ -630,11 +645,39 @@ say which units a file uses (`light_units`).
   `walls` line mesh in the navmesh file.
 * **Slot 2, triggers:** a table of offsets (the index is the number room
   scripts use) to records `u32 type, 0, f32 height, 0` followed by points;
-  type 0 is a line the player can cross, type 1 a four-cornered area. 1,188
-  lines and 1,105 areas, exported as `<room>_zones.glb`.
+  type 0 is a line the player can cross, type 1 a four-cornered area. A zone
+  applies from its points' height up to `height`. An area must hold the
+  character's whole collision circle. 1,188 lines and 1,105 areas, exported as
+  `<room>_zones.glb` (see below).
 * **Slot 14, floor groups:** `u32` group count, offsets, then groups of
   triangle numbers that scripts switch on and off together. 223 groups,
   exported as `floor_groupNN` nodes in the navmesh file.
+
+**What zones do.** A zone has no effect of its own: the room's scripts test it
+(commands 27 and 29, conditions 01, 02, 03, 06 and 07). The nodes of the zones
+file are named after that, for example
+`zone02__boundary__camera_set1_rail0__prefetch_exit0`. Two underscores separate
+the parts (the number, the shape, then each thing the zone does) and one
+separates the words inside a part:
+
+| Part of the name | Meaning |
+| --- | --- |
+| `exit<n>` | stepping in leaves the room through exit n |
+| `camera_set<S>_rail<R>`, `camera_set<S>_fixed` | switches to this camera |
+| `prefetch_exit<n>`, `prefetch_ST_xxx` | loads the next room early |
+| `action<n>`, `shared_action<n>` | starts one of the room's action scripts, or one of the game's |
+| `facing` | the action needs the character to face the zone |
+| `trigger` | the scripts test it, with no more specific effect found |
+| `unused_here` | not used in this room, but in a variant of it (rooms with the same zone table share one map) |
+| `unknown` | nothing the game does was found to use it |
+
+1,972 zones are used in their own room, 238 only in a variant, and 83 are
+unknown. The node's `uses` extra holds the details: the camera's node in the
+room file (null for the two rooms' missing rail) and the crossing direction
+it needs, where an exit leads, which
+scripts test the zone and for which characters, and `used_in` for variants.
+`tools/derive_room_logic.py` derives all of this from the executable into
+`hgexport/data/room_logic.json`, so exporting does not need the executable.
 
 ### Screen effects (slot 13)
 

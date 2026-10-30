@@ -373,12 +373,56 @@ class ModelAndSceneTests(unittest.TestCase):
         from hgexport.export.stage import StageOptions, export_navmesh, export_stage
         with tempfile.TemporaryDirectory() as tmp:
             rep = export_stage(DATA / "ST_020" / "ST_021.PAC", Path(tmp) / "st.glb", StageOptions())
-            self.assertIn("ST_021_cam1_rail", rep["clips"])
+            self.assertIn("ST_021_cam_set1_rail1_motion", rep["clips"])
             g = Gltf(Path(tmp) / "st.glb")
             cams = [c for c in g.json["cameras"]]
             # 60 degree horizontal FOV at 4:3 -> ~46.8 degree vertical
             self.assertAlmostEqual(cams[0]["perspective"]["yfov"], 0.8170, places=3)
             self.assertEqual(export_navmesh(DATA / "ST_020" / "ST_021.PAC", Path(tmp) / "nav.glb")["triangles"], 304)
+
+    def test_stage_cameras_follow_the_scripts(self):
+        from hgexport.export.stage import StageOptions, export_stage
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "st.glb"
+            export_stage(DATA / "ST_010" / "ST_012.PAC", out, StageOptions())
+            self.assertEqual(validate(out), [])
+            nodes = {n["name"]: n for n in Gltf(out).json["nodes"] if "camera" in n}
+        # rail 0 belongs to set 1 (68 degrees in the game), not to set 0 (80)
+        self.assertEqual(nodes["ST_012_cam_set1_rail0"]["extras"]["horizontal_fov_degrees"], 68.0)
+        self.assertEqual(nodes["ST_012_cam_set3_rail1"]["extras"]["horizontal_fov_degrees"], 62.0)
+        fixed = nodes["ST_012_cam_set2_fixed"]
+        self.assertTrue(fixed["extras"]["used_by_scripts"])
+        self.assertAlmostEqual(fixed["translation"][0], -3.449, places=2)
+        self.assertFalse(nodes["ST_012_cam_set4_fixed"]["extras"]["used_by_scripts"])
+        self.assertNotIn("ST_012_cam_set1_fixed", nodes)          # only ever used with its rail
+
+    def test_zone_names_say_what_zones_do(self):
+        from hgexport.export.stage import export_stage, export_zones, StageOptions
+        with tempfile.TemporaryDirectory() as tmp:
+            out, room = Path(tmp) / "z.glb", Path(tmp) / "room.glb"
+            rep = export_zones(DATA / "ST_010" / "ST_012.PAC", out)
+            self.assertEqual(validate(out), [])
+            self.assertEqual(rep["zones"], 20)
+            nodes = {n["extras"]["index"]: n for n in Gltf(out).json["nodes"] if "index" in n.get("extras", {})}
+            export_stage(DATA / "ST_010" / "ST_012.PAC", room, StageOptions())
+            cameras = {n["name"] for n in Gltf(room).json["nodes"] if "camera" in n}
+        self.assertEqual(nodes[2]["name"], "zone02__boundary__camera_set1_rail0__prefetch_exit0")
+        self.assertEqual(nodes[1]["name"], "zone01__area__exit1__camera_set2_fixed")
+        self.assertEqual(nodes[1]["extras"]["uses"]["exits"], [{"exit": 1, "leads_to": ["ST_011"]}])
+        self.assertTrue(nodes[10]["name"].endswith("__facing"))
+        for node in nodes.values():
+            for camera in node["extras"]["uses"].get("cameras", []):
+                self.assertIn(camera["node"], cameras)            # names a node of the room file
+
+    def test_zones_of_room_variants(self):
+        from hgexport.export.roomlogic import room_logic, zone_extras
+        rooms = room_logic()
+        self.assertEqual(sum("used_in" not in z for r in rooms.values() for z in r["zones"].values()), 1972)
+        self.assertEqual(rooms["ST_063"]["camera_rails"], {})     # requests rail 1, the file has only rail 0
+        self.assertIsNone(zone_extras("ST_063", rooms["ST_063"]["zones"]["5"])["cameras"][0]["node"])
+        twin = rooms["ST_031"]["zones"]["2"]                      # same table as rooms 0x21, 0x32 and 0xE0
+        self.assertEqual(list(twin), ["used_in"])
+        self.assertIn("ST_021", {u["room"] for u in twin["used_in"]})
 
     def test_root_motion_moves_forward(self):
         from hgexport.export.character import CharacterOptions, export_character
